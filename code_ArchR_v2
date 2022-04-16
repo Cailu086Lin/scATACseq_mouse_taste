@@ -1,0 +1,3212 @@
+---
+title: "scATAC_Seq_mouse_taste"
+author: "Caulu Lin"
+date: "4/18/2021"
+output: html_document
+---
+
+
+
+rm(list = ls())
+library(ArchR)
+set.seed(1)
+addArchRThreads(threads = 16,force=TRUE) 
+#######
+
+####### import data
+addArchRGenome("mm10")
+inputFiles <-c('PBS'="~/scATAC/Control_fragments.tsv.gz", 'LPS'="~/scATAC/LPS_fragments.tsv.gz")
+
+ArrowFiles <- createArrowFiles(inputFiles=inputFiles,
+  filterTSS = 4,
+  filterFrags = 1000, 
+  addTileMat = TRUE,
+  addGeneScoreMat = TRUE)
+
+
+### Inferring Doublets
+doubScores <- addDoubletScores(
+  input = ArrowFiles,
+  k = 10, #Refers to how many cells near a "pseudo-doublet" to count.
+  knnMethod = "UMAP", #Refers to the embedding to use for nearest neighbor search.
+  LSIMethod = 1
+)
+
+
+
+
+#### create ArchRProject}
+proj <- ArchRProject(
+  ArrowFiles = ArrowFiles, 
+  outputDirectory = "/home/cailu/results20220316",
+  copyArrows = TRUE #This is recommened so that you maintain an unaltered copy for later usage.
+)
+
+
+
+### check matrices available
+getAvailableMatrices(proj)
+
+
+
+##Now we can filter putative doublets based on the previously determined doublet scores using the filterDoublets() function. This doesn’t physically remove data from the Arrow files but rather tells the ArchRProject to ignore these cells for downstream analysis.
+
+#####intefer doublets
+doubScores <- addDoubletScores(
+  input = ArrowFiles,
+  k = 10, #Refers to how many cells near a "pseudo-doublet" to count.
+  knnMethod = "UMAP", #Refers to the embedding to use for nearest neighbor search.
+  LSIMethod = 1
+)
+######
+
+
+#### function to filter  doublets
+filterDoublets <- function(ArchRProj = NULL, cutEnrich = 1, cutScore = -Inf, filterRatio = 1){
+
+  fn <- unclass(lsf.str(envir = asNamespace("ArchR"), all = TRUE))
+    for (i in seq_along(fn)) {
+        tryCatch({
+            eval(parse(text = paste0(fn[i], "<-ArchR:::", fn[i])))
+        }, error = function(x) {
+        })
+    }
+
+  .validInput(input = ArchRProj, name = "ArchRProj", valid = c("ArchRProj"))
+  .validInput(input = cutEnrich, name = "cutEnrich", valid = c("numeric"))
+  .validInput(input = cutScore, name = "cutScore", valid = c("numeric"))
+  .validInput(input = filterRatio, name = "filterRatio", valid = c("numeric"))
+
+  if(any(grepl("filterDoublets", names(ArchRProj@projectSummary)))){
+    stop("Already ran filterDoublets on ArchRProject! Cannot be re-ran on an ArchRProject!")
+  }
+
+  df <- getCellColData(ArchRProj, c("Sample", "DoubletEnrichment", "DoubletScore"))
+  splitDF <- split(seq_len(nrow(df)), as.character(df$Sample))
+
+  cellsFilter <- lapply(splitDF, function(y){
+
+    x <- df[y, ,drop = FALSE]
+
+    n <- nrow(x)
+
+    x <- x[order(x$DoubletEnrichment, decreasing = TRUE), ]
+    
+    if(!is.null(cutEnrich)){
+      x <- x[which(x$DoubletEnrichment >= cutEnrich), ]
+    } 
+    
+    if(!is.null(cutScore)){
+      x <- x[which(x$DoubletScore >= cutScore), ]
+    } 
+
+    if(nrow(x) > 0){
+      head(rownames(x), filterRatio * n * (n / 100000))
+    }else{
+      NULL
+    }
+
+  }) %>% unlist(use.names=FALSE)
+
+  message("Filtering ", length(cellsFilter), " cells from ArchRProject!")
+  tabRemove <- table(df[cellsFilter,]$Sample)
+  tabAll <- table(df$Sample)
+  samples <- unique(df$Sample)
+  for(i in seq_along(samples)){
+    if(!is.na(tabRemove[samples[i]])){
+      message("\t", samples[i], " : ", tabRemove[samples[i]], " of ", tabAll[samples[i]], " (", round(100 * tabRemove[samples[i]] / tabAll[samples[i]], 1),"%)")
+    }else{
+      message("\t", samples[i], " : ", 0, " of ", tabAll[samples[i]], " (0%)")
+    }
+  }
+
+  if(length(cellsFilter) > 0){
+    
+    ArchRProj@cellColData <- ArchRProj@cellColData[rownames(ArchRProj@cellColData) %ni% cellsFilter,,drop=FALSE]
+
+  }
+  
+  ArchRProj
+
+}
+
+
+## filter doublets
+proj <- filterDoublets(ArchRProj = proj)
+
+
+
+
+
+### Dimensionality Reduction and Clustering
+
+proj <- addIterativeLSI(
+    ArchRProj = proj,
+    useMatrix = "TileMatrix", 
+    name = "IterativeLSI", 
+    iterations = 4, 
+    clusterParams = list( #See Seurat::FindClusters
+        resolution = c(0.1, 0.2, 0.4), 
+        sampleCells = 10000, 
+        n.start = 10
+    ), 
+    varFeatures = 15000, 
+    dimsToUse = 1:30,
+    force=TRUE
+)
+
+
+
+###To call clusters in this reduced dimension sub-space, we use the addClusters() function which uses Seurat’s graph clustering as the ###default clustering method.
+
+####Batch effect removeing
+proj<- addHarmony(
+    ArchRProj = proj,
+    reducedDims = "IterativeLSI",
+    name = "Harmony",
+    groupBy = "Sample",
+    force = TRUE
+)
+
+########
+proj <- addClusters(input = proj, reducedDims = "Harmony", force = TRUE)
+
+
+
+###Visualizing in a 2D UMAP Embedding
+###We can visualize our scATAC-seq data using a 2-dimensional representation such as Uniform Manifold Approximation and Projection (UMAP). ###To do this, we add a UMAP embedding to our ArchRProject object with the addUMAP() function. This function uses the uwot package to ###perform UMAP.
+
+
+
+proj <- addUMAP(ArchRProj = proj, reducedDims = "Harmony")
+
+
+#########
+#Using this UMAP, we can visualize various attributes of our cells which are stored in a matrix called cellColData in our ArchRProject. To #do this, we use the plotEmbedding() function and we specify the variable to use for coloration via a combination of the colorBy and name #parameters.
+
+###### color by “Sample”
+
+p1 <- plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "Sample", embedding = "UMAP")+theme(plot.title=element_blank(),
+legend.text=element_text(size=14), legend.title=element_blank(), axis.title=element_text(size=16), legend.position=c(0.2, 0.8))+guides(color=guide_legend(override.aes = list(size=8),ncol=1))
+
+#### color by “Clusters”
+
+p2 <- plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "Clusters2", embedding = "UMAP")+scale_color_hue(labels =c("1-Taste type I",
+    "2-Von Ebner duct",
+    "3-Stem/Progenitor 1",
+    "4-Nontaste intermediate 1",
+    "5-Nontaste intermediate 2",
+    "6-Nontaste cornifying",
+    "7-Stem/Progenitor 2",
+    "8-Stem/Progenitor 3",
+    "9-Langerhans cells",
+    "10-Taste type II",
+    "11-Taste type III"
+    ))+theme(plot.title=element_blank(),
+legend.text=element_text(size=14), legend.title=element_blank(), axis.title=element_text(size=16), legend.position="right")+guides(color=guide_legend(override.aes = list(size=8),ncol=1))
+
+
+####### merge plot
+ggAlignPlots(p1, p2, type = "h")
+
+
+pdf("Plot-UMAP_2.pdf", width = 14, height = 5, onefile=F) #6A
+ggAlignPlots(p1, p2, type = "h")
+dev.off()
+
+
+
+#####Assigning Clusters with Gene Scores
+proj <- addImputeWeights(proj)
+
+
+#######find marker
+markersGS <- getMarkerFeatures(
+    ArchRProj = proj, 
+    useMatrix = "GeneScoreMatrix", 
+    groupBy = "Clusters",
+    bias = c("TSSEnrichment", "log10(nFrags)"),
+    testMethod = "wilcoxon"
+)
+
+markerList <- getMarkers(markersGS, cutOff = "FDR <= 0.01 & Log2FC >= 1.25")
+markerList$C6
+write.csv(markerList, "markerList_Clusters.csv", row.names=F)
+
+
+
+#### Featureplots
+markerGenes  <- c(
+    "Entpd2", "Kcnj1",#Type I
+    "Gad1", ,"Pkd2L1", "Car4", "Snap25","Ncam1", #Type III
+    "Trpm5", "Gnat3", "Tas1r3", "Plcb2", "Pou2f3", "Kcnh2","Calhm1",
+    "Tas1r2", "Tas2r104" , "Tas2r105", "Tas2r106", "Tas2r107", "Tas2r108", "Tas2r109", "Tas2r110", "Tas2r113", "Tas2r114", "Tas2r115", "Tas2r116", "Tas2r117", "Tas2r120", "Tas2r121", "Tas2r122", "Tas2r124", "Tas2r125", "Tas2r129", "Tas2r130", "Tas2r131", "Tas2r134", "Tas2r136", "Tas2r137", "Tas2r138", "Tas2r139", "Tas2r140",#Type II
+    #"Shh", "Ascl1", #Precursors
+    "Top2a",  #Proliferating
+    "Krt5", #basal cell
+    "Lgr5",  #Progenitors
+    #"Bcl2", #Dying cells
+    "krt4", "krt13",#"Krt32", #differenited
+    "Krt15","Sbsn", #differentiating
+    "krt78", #suprabasal differentiated
+    "krt84", "Krt36" #filiform differentiated cells 
+    #"krt15", "krt5", "Sbsn", "krt10" #keratinocytes
+    )
+p <- plotEmbedding(
+    ArchRProj = proj, 
+    colorBy = "GeneScoreMatrix", 
+    name = markerGenes, 
+    embedding = "UMAP",
+    imputeWeights = getImputeWeights(proj)
+)
+
+dev.new()
+ggsave(filename ='Fig3C.tiff',p, width =20, height =20, units ="cm",dpi = 600, device='tiff', limitsize = TRUE, compression = "lzw")
+dev.off()
+
+#######Rearrange for grid plotting
+
+for (i in 1:20){
+ p[[i]]<-p[[i]]+theme(plot.margin = unit(c(0.1, 0.15, 0.1, 0.15), "cm")) +
+    theme(
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(),
+        plot.title=element_text(hjust=0.5,size=24, face='bold'), 
+        axis.title=element_blank(),
+        legend.position="none"
+    )+ggtitle(markerGenes[i])+
+    scale_fill_gradient(low="grey", high="blue")
+}
+
+px<-cowplot::plot_grid(p[[1]],p[[2]],p[[3]],p[[4]],p[[5]],p[[6]],p[[7]],p[[8]],p[[9]],p[[10]],p[[11]],
+p[[12]],p[[13]],p[[14]],p[[15]],p[[16]],p[[17]],p[[18]],p[[19]],p[[20]], n=5)
+
+dev.new()
+ggsave(filename ='t2.tiff',px, width =20, height =25, units ="cm",dpi = 600, device='tiff', limitsize = TRUE, compression = "lzw")
+dev.off()
+
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0.1, 0.15, 0.1, 0.15), "cm")) +
+    theme(
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(),
+        plot.title=element_text(hjust=0.5,size=14), 
+        axis.title=element_text(size=14)
+    )+
+    scale_fill_gradient(low="blue", high="red")
+})
+
+pdf("Fig3_C.pdf",width = 15, height = 13)
+do.call(cowplot::plot_grid, c(list(ncol = 5),p))
+dev.off()
+
+
+#######Visualizing Genome Browser Tracks
+
+ArchRBrowser(ArchRProj = proj)
+
+### track plot
+p <- plotBrowserTrack(
+    ArchRProj = proj, 
+    groupBy = "Clusters2", 
+    geneSymbol = markerGenes, 
+    upstream = 50000,
+    downstream = 50000
+)
+
+
+plotPDF(plotList = p, 
+    name = "Plot-Tracks-Marker-Genes_2.pdf", 
+    ArchRProj = proj, 
+    addDOC = FALSE, width = 7, height = 5)
+    
+
+###Heatmap  with Gene Score 
+    
+heatmapGS <- markerHeatmap(
+  seMarker = markersGS, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 1.25", 
+  labelMarkers = markerGenes2,
+  transpose = TRUE
+)
+ComplexHeatmap::draw(heatmapGS, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+plotPDF(heatmapGS, name = "GeneScores-Marker-Heatmap_2", width = 12, height = 8, ArchRProj = proj, addDOC = FALSE)
+
+
+## rename samples
+remapSample <- c(
+   "Control"="PBS",
+   "LPS"="LPS")
+remapSample <- remapSample[names(remapSample) %in% proj$Sample]
+
+proj$Sample2 <- mapLabels(proj$Sample, newLabels = remapSample, oldLabels = names(remapSample))
+
+
+#8.Defining Cluster Identity with scRNA-seq
+
+remapClust <- c(
+   "C1"="C1-Taste type I",
+   "C2"="C2-von Ebner duct",
+   "C3"="C3-Stem/Progenitor 1",
+   "C4"="C4-Nontaste intermediate 1",
+   "C5"="C5-Nontaste intermediate 2",
+   "C6"="C6-Nontaste cornifying",
+   "C7"="C7-Stem/Progenitor 2",
+   "C8"="C8-Stem/Progenitor 3",
+   "C9"="C9-Langerhans cells",
+   "C10"="C10-Taste type II",
+   "C11"="C11-Taste type III")
+remapClust <- remapClust[names(remapClust) %in% proj$Clusters]
+
+proj$Clusters2 <- mapLabels(proj$Clusters, newLabels = remapClust, oldLabels = names(remapClust))
+
+
+#Save data
+proj <- saveArchRProject(ArchRProj = proj, "/home/cailu/results)
+
+##load data
+proj <- loadArchRProject("Save_Proj")
+
+##Pseudo-bulk Replicates in ArchR
+
+proj2<- addGroupCoverages(ArchRProj = proj, groupBy = "Clusters2")
+
+#10.2 Calling Peaks w/ Macs2
+pathToMacs2 <- findMacs2()
+
+proj2 <- addReproduciblePeakSet(
+    ArchRProj = proj2, 
+    groupBy = "Clusters2", 
+    pathToMacs2 = pathToMacs2
+)
+
+getPeakSet(proj2)
+
+
+proj3<- addPeakMatrix(proj2)
+getAvailableMatrices(proj3)
+
+
+#Identifying Marker Peaks with ArchR
+table(proj3$Clusters2)
+
+markersPeaks <- getMarkerFeatures(
+    ArchRProj = proj3, 
+    useMatrix = "PeakMatrix", 
+    groupBy = "Clusters2",
+    bias = c("TSSEnrichment", "log10(nFrags)"),
+    testMethod = "wilcoxon")
+
+
+
+markersPeaks
+
+
+markerList <- getMarkers(markersPeaks, cutOff = "FDR <= 0.01 & Log2FC >= 0.5")
+markerList
+
+
+markerList$'11.Type II'
+
+markerList <- getMarkers(markersPeaks, cutOff = "FDR <= 0.01 & Log2FC >= 1.5", returnGR = TRUE)
+markerList
+
+write.csv(markerList, "markerPeaks_Up_Dow_S6-10Fig.csv", row.names=F)
+
+
+########Plotting Marker Peaks in ArchR
+heatmapPeaks <- markerHeatmap(
+  seMarker = markersPeaks, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 0.5",
+  transpose = TRUE
+)
+draw(heatmapPeaks, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+
+plotPDF(heatmapPeaks, name = "Peak-Marker-Heatmap_2", width = 18, height = 6, ArchRProj = proj3, addDOC = FALSE)
+
+
+#11.2.2 Marker Peak MA and Volcano Plots
+
+##Type II
+pma <- markerPlot(seMarker = markersPeaks, name = "1.Type I", cutOff = "FDR <= 0.1 & Log2FC >= 1", plotAs = "MA")
+pma
+
+
+pv <- markerPlot(seMarker = markersPeaks, name = "1.Type I", cutOff = "FDR <= 0.1 & Log2FC >= 1", plotAs = "Volcano")
+pv
+
+plotPDF(pma, pv, name = "Type II-Markers-MA-Volcano", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+
+
+##Type I
+pma <- markerPlot(seMarker = markersPeaks, name = "5.Type I", cutOff = "FDR <= 0.1 & Log2FC >= 1", plotAs = "MA")
+pma
+
+
+pv <- markerPlot(seMarker = markersPeaks, name = "5.Type I", cutOff = "FDR <= 0.1 & Log2FC >= 1", plotAs = "Volcano")
+pv
+
+plotPDF(pma, pv, name = "Type I-Markers-MA-Volcano", width = 5.5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+
+##Type III
+pma <- markerPlot(seMarker = markersPeaks, name = "6.Type III", cutOff = "FDR <= 0.1 & Log2FC >= 1", plotAs = "MA")
+pma
+
+
+pv <- markerPlot(seMarker = markersPeaks, name = "6.Type III", cutOff = "FDR <= 0.1 & Log2FC >= 1", plotAs = "Volcano")
+pv
+
+plotPDF(pma, pv, name = "Type III-Markers-MA-Volcano", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+
+#11.2.3 Marker Peaks in Browser Tracks
+
+p <- plotBrowserTrack(
+    ArchRProj = proj3, 
+    groupBy = "Sample", 
+    geneSymbol = c("Trpm5", "Gnat3", "Tas1r3", "Plcb2", "Pou2f3", "Kcnh2","Calhm1","Tas2r102",
+    "Tas1r2", "Tas2r104" , "Tas2r105", "Tas2r106", "Tas2r107", "Tas2r108", "Tas2r109", "Tas2r110", "Tas2r113", "Tas2r114", "Tas2r115", "Tas2r116", "Tas2r117", "Tas2r120", "Tas2r121", "Tas2r122", "Tas2r124", "Tas2r125", "Tas2r129", "Tas2r130", "Tas2r131", "Tas2r134", "Tas2r136", "Tas2r137", "Tas2r138", "Tas2r139", "Tas2r140"),
+    features =  getMarkers(markersPeaks, cutOff = "FDR <= 0.1 & Log2FC >= 1", returnGR = TRUE)["C10-Taste type II"],
+    upstream = 50000,
+    downstream = 50000
+)
+
+
+grid::grid.newpage()
+grid::grid.draw(p$Trpm5)
+plotPDF(p, name = "Plot-Tracks-With-Features", width = 9, height = 5, ArchRProj = proj3, addDOC = FALSE)
+
+
+######2021-06-17 ####### Compare  specific clusters
+
+# cluster 3 vs. cluster 8
+markerTest1 <- getMarkerFeatures(
+  ArchRProj =  proj2,
+  useMatrix = "PeakMatrix",
+  groupBy = "Clusters2",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "3.C3",
+  bgdGroups = "8.C8"
+)
+markerList1 <- getMarkers(markerTest1, cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", returnGR = FALSE)
+markerList1
+
+#(b) cluster 3 vs. cluster 7; 
+markerTest2 <- getMarkerFeatures(
+  ArchRProj =  proj2,
+  useMatrix = "PeakMatrix",
+  groupBy = "Clusters2",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "3.C3",
+  bgdGroups = "7.C7"
+)
+markerList2 <- getMarkers(markerTest2, cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", returnGR = FALSE)
+markerList2
+
+#(c) cluster 7 vs cluster 1; 
+markerTest3 <- getMarkerFeatures(
+  ArchRProj =  proj2,
+  useMatrix = "PeakMatrix",
+  groupBy = "Clusters2",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "1.Type I",
+  bgdGroups = "7.C7"
+)
+markerList3 <- getMarkers(markerTest3, cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", returnGR = FALSE)
+markerList3
+
+#(d) cluster 7 vs. cluster 11; 
+markerTest4 <- getMarkerFeatures(
+  ArchRProj =  proj2,
+  useMatrix = "PeakMatrix",
+  groupBy = "Clusters2",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "11.Type III",
+  bgdGroups = "7.C7"
+)
+markerList4 <- getMarkers(markerTest4, cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", returnGR = FALSE)
+markerList4
+
+#(e) cluster 7 vs. cluster 10; 
+
+markerTest5 <- getMarkerFeatures(
+  ArchRProj = proj2,
+  useMatrix = "PeakMatrix",
+  groupBy = "Clusters2",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "10.Type II",
+  bgdGroups = "7.C7"
+)
+markerList5 <- getMarkers(markerTest5, cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", returnGR = FALSE)
+markerList5
+
+#(f) cluster 10 vs cluster 11; and
+markerTest6 <- getMarkerFeatures(
+  ArchRProj =  proj2,
+  useMatrix = "PeakMatrix",
+  groupBy = "Clusters2",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "10.Type II",
+  bgdGroups = "11.Type III"
+)
+markerList6 <- getMarkers(markerTest6, cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", returnGR = FALSE)
+markerList6
+
+# (g) cluster 11 vs. cluster 1. 
+
+markerTest7 <- getMarkerFeatures(
+  ArchRProj = proj2,
+  useMatrix = "PeakMatrix",
+  groupBy = "Clusters2",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "1.Type I",
+  bgdGroups = "11.Type III"
+)
+markerList7 <- getMarkers(markerTest7, cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", returnGR = FALSE)
+markerList7
+
+#########################
+markerList<-c(markerList1,markerList2,markerList3,markerList4,markerList5,markerList6,markerList7)
+
+write.csv(markerList, "marker_Up_Dow_ClusterComparison_v3_PeakMatrix.csv", row.names=F)
+
+
+
+pma1 <- markerPlot(seMarker = markerTest1, name = "3.C3", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv1 <- markerPlot(seMarker = markerTest1, name = "3.C3", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma2 <- markerPlot(seMarker = markerTest2, name = "3.C3", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv2 <- markerPlot(seMarker = markerTest2, name = "3.C3", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+
+pma3 <- markerPlot(seMarker = markerTest3, name = "1.Type I", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv3 <- markerPlot(seMarker = markerTest3, name = "1.Type I", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma4 <- markerPlot(seMarker = markerTest4, name = "11.Type III", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv4 <- markerPlot(seMarker = markerTest4, name = "11.Type III", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma5 <- markerPlot(seMarker = markerTest5, name = "10.Type II", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv5 <- markerPlot(seMarker = markerTest5, name = "10.Type II", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma6 <- markerPlot(seMarker = markerTest6, name = "10.Type II", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv6 <- markerPlot(seMarker = markerTest6, name = "10.Type II", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma7 <- markerPlot(seMarker = markerTest7, name = "1.Type I", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv7 <- markerPlot(seMarker = markerTest7, name = "1.Type I", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+
+plotPDF(pma1, pv1, name = "Supplemental_FigureX1_cluster_3_vs_cluster_8-Markers-MA-Volcano_C1_PeakMatrix", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma2, pv2, name = "Supplemental_FigureX2_cluster_3_vs_cluster_7-Markers-MA-Volcano_C2_PeakMatrix", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma3, pv3, name = "Supplemental_FigureX3_cluster_7_vs_cluster_1-Markers-MA-Volcano_C3_PeakMatrix", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma4, pv4, name = "Supplemental_FigureX4_cluster_7_vs_cluster_11-Markers-MA-Volcano_C4_PeakMatrix", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma5, pv5, name = "Supplemental_FigureX5_cluster_7_vs_cluster_10-Markers-MA-Volcano_C5_PeakMatrix", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma6, pv6, name = "Supplemental_FigureX6_cluster_10_vs_cluster_11-Markers-MA-Volcano_C6_PeakMatrix", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma7, pv7, name = "Supplemental_FigureX7_cluster11_vs_cluster_1_-Markers-MA-Volcano_C7_PeakMatrix", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+
+
+
+##################
+proj4<- addMotifAnnotations(ArchRProj = proj2, motifSet = "cisbp", name = "Motif")
+
+
+motifsUp <- peakAnnoEnrichment(
+    seMarker = markerTest7,
+    ArchRProj = proj4,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.01 & Log2FC >= 1.5"
+  )
+  
+df <- data.frame(TF = rownames(motifsUp), mlog10Padj = assay(motifsUp)[,1])
+df <- df[order(df$mlog10Padj, decreasing = TRUE),]
+df$rank <- seq_len(nrow(df))
+  
+  
+  ggUp <- ggplot(df, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 1) +
+  ggrepel::geom_label_repel(
+        data = df[rev(seq_len(30)), ], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 1.5,
+        nudge_x = 2,
+        color = "black"
+  ) + theme_ArchR() + 
+  ylab("-log10(P-adj) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = paletteContinuous(set = "comet"))
+
+ggUp
+
+
+motifsDo <- peakAnnoEnrichment(
+    seMarker = markerTest7,
+    ArchRProj = proj4,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.01 & Log2FC <= -1.5"
+  )
+
+
+df <- data.frame(TF = rownames(motifsDo), mlog10Padj = assay(motifsDo)[,1])
+df <- df[order(df$mlog10Padj, decreasing = TRUE),]
+df$rank <- seq_len(nrow(df))
+
+
+ggDo <- ggplot(df, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 1) +
+  ggrepel::geom_label_repel(
+        data = df[rev(seq_len(30)), ], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 1.5,
+        nudge_x = 2,
+        color = "black"
+  ) + theme_ArchR() + 
+  ylab("-log10(FDR) Motif Enrichment") +
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = paletteContinuous(set = "comet"))
+
+ggDo
+
+
+plotPDF(ggUp, ggDo,name = "cluster_11_vs_cluster_1-Markers-Motifs-Deviation_20210617", width = 10, height = 5, ArchRProj = proj4, addDOC = FALSE)
+
+
+######computation Correlation TF to GS
+##Export Motif
+corTFGS <- correlateMatrices(proj4, useMatrix1 = "MotifMatrix", useMatrix2 = "GeneScoreMatrix")
+
+#Group Motif Deviations
+seGroupMotif <- exportGroupSE(ArchRProj = proj4, useMatrix = "MotifMatrix", groupBy = "Clusters2")
+
+#Get Deviation Z-Scores
+seZ <- seGroupMotif[rowData(seGroupMotif)$seqnames=="z",]
+seZ <- seZ[rowData(seZ)$name %in% corTFGS[,1], ]
+
+#Max Delta
+maxD <- lapply(seq_len(ncol(seZ)), function(x){
+  rowMaxs(assay(seZ) - assay(seZ)[,x])
+}) %>% Reduce("cbind", .) %>% rowMaxs
+corTFGS$maxDelta <- maxD[match(corTFGS[,1], rowData(seZ)$name)]
+
+
+#Filter By Absolute Correlation and deduplicate
+corTFGS <- corTFGS[order(abs(corTFGS$cor), decreasing = TRUE), ]
+corTFGS <- corTFGS[which(!duplicated(gsub("\\-.*","",corTFGS[,2]))), ]
+
+#Identify Sig Relation Ships
+corTFGS2 <- corTFGS[which(corTFGS$cor > 0.5 & corTFGS$padj < 0.001), ]
+corTFGS$sig <- "No"
+corTFGS$sig[which(corTFGS[,1] %in% corTFGS2[,1])] <- "Yes"
+corTFGS$sig[which(corTFGS$cor < 0.5)] <- "No"
+corTFGS$sig[corTFGS$maxDelta < quantile(corTFGS$maxDelta, 0.5)] <- "No"
+
+
+pdf("Plot-Cor-TF-GS-2.pdf", width = 4, height = 4, useDingbats = FALSE, onefile=F)
+ggplot(data.frame(corTFGS), aes(cor, maxDelta, color = sig)) +
+  geom_point() + 
+  theme_ArchR() +
+  geom_vline(xintercept = 0) + 
+  scale_color_manual(values = c("No"="darkgrey", "Yes"="firebrick3")) +
+  xlab("Correlation To GS") +
+  ylab("TF Motif Delta") +
+  scale_y_continuous(expand = c(0,0), limits = c(0, max(corTFGS$maxDelta)*1.05))
+dev.off()
+
+readr::write_tsv(data.frame(corTFGS), "Save-Correlations-TF-To-GS-2.tsv")
+
+
+
+
+
+#########################################################################################################################################
+##Figure #2021-06-17
+markerGenes<-c("Pou2f3", "Ascl1", "Sox2", "Trp63")
+markerGenes<-c("Pou1f1","Pou2f1","Pou2f2","Pou2f3","Pou3f1","Pou3f2","Pou3f3","Pou3f4","Pou4f1","Pou4f2","Pou4f3","Pou5f1","Pou6f1","Pou6f2")
+
+
+p1 <- plotEmbedding(
+  ArchRProj = proj2, 
+  colorBy = "GeneScoreMatrix", 
+  name = markerGenes, 
+  embedding = "UMAP", 
+  continuousSet = "horizonExtra", 
+  quantileCut = c(0, 0.999),
+  log2Norm = TRUE
+)
+
+px1<-p1$Pou2f3+theme(axis.title.x=element_blank(), legend.position="none") + ylab("Pou2f3")+ggtitle("Gene Score Matrix")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.4 to 1.6"))+theme(plot.title=element_text(face="bold", size=14, hjust=0.5), axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px2<-p1$Ascl1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Ascl1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.25 to 1.25"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px3<-p1$Sox2+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Sox2")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="1.1 to 1.7"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px4<-p1$Trp63+theme(axis.title.x=element_blank(), plot.title=
+element_blank()) +ylab("Trp63")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.75 to 1.75"))+theme(axis.title.y=element_text(size=14),legend.text=element_blank(),legend.title=element_blank())+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+###
+px1<-p1$Pou1f1+theme(axis.title.x=element_blank(), legend.position="none") + ylab("Pou1f1")+ggtitle("Gene Score Matrix")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.11 to 0.33"))+theme(plot.title=element_text(face="bold", size=14, hjust=0.5), axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px2<-p1$Pou2f1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou2f1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.6 to 1.3"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px3<-p1$Pou2f2+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou2f2")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.2 to 0.5"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px4<-p1$Pou2f3+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou2f3")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.4 to 1.6"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px5<-p1$Pou3f1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou3f1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.4 to 1.0"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px6<-p1$Pou3f2+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou3f2")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.13 to 0.32"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px7<-p1$Pou3f3+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou3f3")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.05 to 0.25"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px8<-p1$Pou3f4+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou3f4")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.05 to 0.25"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px9<-p1$Pou4f1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou4f1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.28 to 0.66"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px10<-p1$Pou4f2+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou4f2")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.18 to 0.38"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px11<-p1$Pou4f3+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou4f3")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.45 to 0.85"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px12<-p1$Pou5f1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou5f1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.08 to 0.24"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px13<-p1$Pou6f1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou6f1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.02 to 0.02"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px14<-p1$Pou6f2+theme(axis.title.x=element_blank(), plot.title=
+element_blank()) +ylab("Pou6f2")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.35 to 0.75"))+theme(axis.title.y=element_text(size=14),legend.text=element_blank(),legend.title=element_blank())+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+#px14<-px14+labs(fill = "Gene Score")
+
+
+##modiif
+markerMotifs<-c("Pou2f3_487", "Ascl1_780",  "Sox2_750",  "Trp63_853")
+markerMotifs <-c("Pou1f1_615","Pou2f1_619","Pou2f2_616","Pou2f3_487","Pou3f1_620","Pou3f2_555","Pou3f3_540","Pou3f4_561","Pou4f1_841","Pou4f2_840","Pou4f3_446","Pou5f1_618","Pou6f1_416","Pou6f2_617")
+
+p2 <- plotEmbedding(
+  ArchRProj = proj2, 
+  colorBy = "MotifMatrix", 
+  name = paste0("z:",markerMotifs), 
+  embedding = "UMAP", 
+  continuousSet = "solarExtra", 
+  quantileCut = c(0.01, 0.99),
+  log2Norm = FALSE
+)  
+
+py1<-p2$`z:Pou2f3_487`+theme(axis.title=element_blank(), legend.position="none") +ggtitle("Motif Deviation")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.5 to 0.5"))+theme(plot.title=element_text(face="bold", size=14, hjust=0.5))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py2<-p2$`z:Ascl1_780`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-1 to 5"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py3<-p2$`z:Sox2_750`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-2 to 3"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py4<-p2$`z:Trp63_853`+theme(axis.title=element_blank(), plot.title=
+element_blank()) +
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-9 to 6"))+theme(legend.text=element_blank(),legend.title=element_blank())+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+###
+py1<-p2$`z:Pou2f3_487`+theme(axis.title=element_blank(), legend.position="none") +ggtitle("Motif Deviation")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.5 to 0.5"))+theme(plot.title=element_text(face="bold", size=14, hjust=0.5))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py2<-p2[[2]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.4 to 0.6"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py3<-p2[[3]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.45 to 0.50"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py4<-p2[[4]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.5 to 0.5"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py5<-p2[[5]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-1 to 1"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py6<-p2[[6]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.7 to 0.3"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py7<-p2[[7]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-1 to 4"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py8<-p2[[8]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.6 to 0.6"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py9<-p2[[9]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.5 to 1.0"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py10<-p2[[10]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-1 to 5"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py11<-p2[[11]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.6 to 0.5"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py12<-p2[[12]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.5 to 8.5"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py13<-p2[[13]]+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.4 to 0.5"))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+py14<-p2[[14]]+theme(axis.title=element_blank(), plot.title=
+element_blank()) +
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.7 to 0.7"))+theme(legend.text=element_blank(),legend.title=element_blank())+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+#py14<-py14+labs(fill = "Motif Deviation Score")
+
+
+
+pl<-cowplot::plot_grid(px1,py1,px2,py2, px3, py3,px4,py4,ncol = 2,rel_widths=c(1,1,1,1),rel_heights=c(1.18,1,1,1.41), align=c("v","h"))
+
+pl<-cowplot::plot_grid(px1,py1,px2,py2, px3, py3,px4,py4,px5,py5,px6,py6,px7,py7,px8,py8,px9,py9,px10,py10,px11,py11,px12,py12,px13,py13,px14,py14,ncol = 2,rel_widths=c(1,1,1,1),rel_heights=c(1.15,1,1,1,1,1,1,1,1,1,1,1,1,1.38), align=c("v","h"))
+
+
+
+dev.new()
+ggsave(filename ='Plot-POU_TF_to_GENE.tiff',pl, width =10, height =58, units ="cm",dpi = 600, device='tiff', limitsize = TRUE, compression = "lzw")
+dev.off()
+
+
+
+
+
+
+
+#By cell types
+
+# Pairwise Testing Between Groups
+proj3 <- addCellColData(ArchRProj = proj3, data = paste0(proj3@cellColData$Clusters2,"_x_",proj3@cellColData$Sample), name = "ClusterBySample", cells = getCellNames(proj3), force = TRUE)
+
+##
+markerTest1 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "1-Taste type I_x_LPS",
+  bgdGroups = "1-Taste type I_x_Control"
+)
+markerList1 <- getMarkers(markerTest1, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList1
+
+markerTest2 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix ="GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "2-Von Ebner ductal_x_LPS",
+  bgdGroups = "2-Von Ebner ductal_x_Control"
+)
+markerList2 <- getMarkers(markerTest2, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList2
+
+markerTest3 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "3-Stem/Progenitor 1_x_LPS",
+  bgdGroups = "3-Stem/Progenitor 1_x_Control"
+)
+markerList3 <- getMarkers(markerTest3, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList3
+
+markerTest4 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "4-Nontaste intermediate 1_x_LPS",
+  bgdGroups = "4-Nontaste intermediate 1_x_Control"
+)
+markerList4 <- getMarkers(markerTest4, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList4
+
+markerTest5 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "5-Nontaste intermediate 2_x_LPS",
+  bgdGroups = "5-Nontaste intermediate 2_x_Control"
+)
+markerList5 <- getMarkers(markerTest5, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList5
+
+markerTest6 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "6-Nontatse cornifying_x_LPS",
+  bgdGroups = "6-Nontatse cornifying_x_Control"
+)
+markerList6 <- getMarkers(markerTest6, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList6
+
+markerTest7 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "7-Stem/Progenitor 2_x_LPS",
+  bgdGroups = "7-Stem/Progenitor 2_x_Control"
+)
+markerList7 <- getMarkers(markerTest7, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList7
+
+markerTest8 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "8-Stem/Progenitor 3_x_LPS",
+  bgdGroups = "8-Stem/Progenitor 3_x_Control"
+)
+markerList8 <- getMarkers(markerTest8, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList8
+
+markerTest9 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "9-Langerhans cells_x_LPS",
+  bgdGroups = "9-Langerhans cells_x_Control"
+)
+markerList9 <- getMarkers(markerTest9, cutOff = "FDR < 0.1 & abs(Log2FC) >0.5", returnGR = FALSE)
+markerList9
+
+markerTest10 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "10-Taste type II_x_LPS",
+  bgdGroups = "10-Taste type II_x_Control"
+)
+markerList10 <- getMarkers(markerTest10, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList10
+
+
+markerTest11 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "11-Taste type III_x_LPS",
+  bgdGroups = "11-Taste type III_x_Control"
+)
+markerList11 <- getMarkers(markerTest11, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList11
+
+
+markerList<-c(markerList1,markerList2,markerList3,markerList4,markerList5,markerList6,markerList7,markerList8,markerList9,markerList10,markerList11)
+
+write.csv(markerList, "markerPeaks_Up_Dow_S6-10Fig_v3_GeneScore.csv", row.names=F)
+
+
+pma1 <- markerPlot(seMarker = markerTest1, name = "1.Type I_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv1 <- markerPlot(seMarker = markerTest1, name = "1.Type I_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma2 <- markerPlot(seMarker = markerTest2, name = "2.C2_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv2 <- markerPlot(seMarker = markerTest2, name = "2.C2_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+
+pma3 <- markerPlot(seMarker = markerTest3, name = "3.C3_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv3 <- markerPlot(seMarker = markerTest3, name = "3.C3_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma4 <- markerPlot(seMarker = markerTest4, name = "4.C4_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv4 <- markerPlot(seMarker = markerTest4, name = "4.C4_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma5 <- markerPlot(seMarker = markerTest5, name = "5.C5_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv5 <- markerPlot(seMarker = markerTest5, name = "5.C5_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma6 <- markerPlot(seMarker = markerTest6, name = "6.C6_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv6 <- markerPlot(seMarker = markerTest6, name = "6.C6_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma7 <- markerPlot(seMarker = markerTest7, name = "7.C7_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv7 <- markerPlot(seMarker = markerTest7, name = "7.C7_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+pma10 <- markerPlot(seMarker = markerTest10, name = "10.Type II_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "MA")
+pv10 <- markerPlot(seMarker = markerTest10, name = "10.Type II_x_LPS", cutOff = "FDR <= 0.01 & abs(Log2FC) >= 1.5", plotAs = "Volcano")
+
+
+
+plotPDF(pma1, pv1, name = "Supplemental_Figure6_Controlvs-LPS-Markers-MA-Volcano_C1_GeneScore", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma2, pv2, name = "Supplemental_Figure10.2_Controlvs-LPS-Markers-MA-Volcano_C2_GeneScore", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma3, pv3, name = "Supplemental_Figure7_Controlvs-LPS-Markers-MA-Volcano_C3_GeneScore", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma4, pv4, name = "Supplemental_Figure8_Controlvs-LPS-Markers-MA-Volcano_C4_GeneScore", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma5, pv5, name = "Supplemental_Figure9_Controlvs-LPS-Markers-MA-Volcano_C5_GeneScore", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma6, pv6, name = "Supplemental_Figure10.3_Controlvs-LPS-Markers-MA-Volcano_C6_GeneScore", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma7, pv7, name = "Supplemental_Figure10_Controlvs-LPS-Markers-MA-Volcano_C7_GeneScore", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma10, pv10, name = "Supplemental_Figure10.1_Controlvs-LPS-Markers-MA-Volcano_C10_GeneScore", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+
+
+
+
+
+# Motif Enrichment in Differential Peaks
+
+markerTest1 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "PeakMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "1.Type I_x_LPS",
+  bgdGroups = "1.Type I_x_PBS"
+)
+markerList1 <- getMarkers(markerTest1, cutOff = "FDR <= 0.05 & abs(Log2FC) >= 1", returnGR = FALSE)
+markerList1
+
+markerTest2 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix ="PeakMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "2.C2_x_LPS",
+  bgdGroups = "2.C2_x_Control"
+)
+markerList2 <- getMarkers(markerTest2, cutOff = "FDR <= 0.05 & abs(Log2FC) >= 1", returnGR = TRUE)
+markerList2
+
+
+markerTest8 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "PeakMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "8.C8_x_LPS",
+  bgdGroups = "8.C8_x_Control"
+)
+markerList8 <- getMarkers(markerTest8, cutOff = "FDR <= 0.1 & abs(Log2FC) >= 1.5", returnGR = TRUE)
+markerList8
+
+markerTest9 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "PeakMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "9.C9_x_LPS",
+  bgdGroups = "9.C9_x_Control"
+)
+markerList9 <- getMarkers(markerTest9, cutOff = "FDR <= 0.1 & abs(Log2FC) >= 1.5", returnGR = TRUE)
+markerList9
+
+markerTest10 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "PeakMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "10.Type II_x_LPS",
+  bgdGroups = "10.Type II_x_Control"
+)
+markerList10 <- getMarkers(markerTest10, cutOff = "FDR <= 0.1 & abs(Log2FC) >= 1.5", returnGR = TRUE)
+markerList10
+
+
+markerTest11 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "PeakMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "11.Type III_x_Control",
+  bgdGroups = "11.Type III_x_LPS"
+)
+markerList11 <- getMarkers(markerTest11, cutOff = "FDR <= 0.55 & abs(Log2FC) >= 1.5", returnGR = TRUE)
+markerList11
+
+
+proj4<- addMotifAnnotations(ArchRProj = proj3, motifSet = "cisbp", name = "Motif")
+
+motifsUp <- peakAnnoEnrichment(
+    seMarker = markerTest10,
+    ArchRProj = proj4,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.01 & Log2FC >= 1.5"
+  )
+  
+df <- data.frame(TF = rownames(motifsUp), mlog10Padj = assay(motifsUp)[,1])
+df <- df[order(df$mlog10Padj, decreasing = TRUE),]
+df$rank <- seq_len(nrow(df))
+  
+  
+  ggUp <- ggplot(df, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 1) +
+  ggrepel::geom_label_repel(
+        data = df[rev(seq_len(30)), ], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 1.5,
+        nudge_x = 2,
+        color = "black"
+  ) + theme_ArchR() + 
+  ylab("-log10(P-adj) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = paletteContinuous(set = "comet"))
+
+ggUp
+
+motifsDo <- peakAnnoEnrichment(
+    seMarker = markerTest10,
+    ArchRProj = proj4,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.01 & Log2FC <= -1.5"
+  )
+
+
+df <- data.frame(TF = rownames(motifsDo), mlog10Padj = assay(motifsDo)[,1])
+df <- df[order(df$mlog10Padj, decreasing = TRUE),]
+df$rank <- seq_len(nrow(df))
+
+
+ggDo <- ggplot(df, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 1) +
+  ggrepel::geom_label_repel(
+        data = df[rev(seq_len(30)), ], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 1.5,
+        nudge_x = 2,
+        color = "black"
+  ) + theme_ArchR() + 
+  ylab("-log10(FDR) Motif Enrichment") +
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = paletteContinuous(set = "comet"))
+
+ggDo
+
+
+plotPDF(ggUp, ggDo,name = "Control-vs-LPS-Markers-Motifs-Enriched_C10", width = 10, height = 5, ArchRProj = proj4, addDOC = FALSE)
+
+
+
+
+##############################################################
+# Motif Enrichment in Marker Peaks
+enrichMotifs <- peakAnnoEnrichment(
+    seMarker = markersPeaks,
+    ArchRProj = proj4,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.01 & Log2FC >= 1.5"
+  )
+
+
+enrichMotifs
+
+heatmapEM <- plotEnrichHeatmap(enrichMotifs, n = 7, transpose = TRUE)
+
+ComplexHeatmap::draw(heatmapEM, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+
+plotPDF(heatmapEM, name = "Motifs-Enriched-Marker-Heatmap", width = 8, height = 6, ArchRProj = proj3, addDOC = FALSE)
+
+
+
+#12.3.1 Encode TF Binding Sites
+proj4 <- addArchRAnnotations(ArchRProj = proj4,  db = "Lola", collection = "EncodeTFBS")
+
+
+#Motif Deviations
+if("Motif" %in% names(proj4@peakAnnotation)){
+    proj4<- addMotifAnnotations(ArchRProj = proj4,motifSet = "cisbp", name = "Motif")}
+
+proj4<- addBgdPeaks(proj4)
+
+proj4 <- addDeviationsMatrix(
+  ArchRProj = proj4, 
+  peakAnnotation = "Motif",
+  force = TRUE
+)
+
+plotVarDev <- getVarDeviations(proj4, name = "MotifMatrix", plot = TRUE)
+
+plotPDF(plotVarDev, name = "Variable-Motif-Deviation-Scores", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+
+#Subset Interested
+motifs <- c("Smarcc1", "Fos", "Nfkb1", "Bacch1", "Rela", "Nfkb2", "Bach2", "Rel", "Fosb", "Foxb1", "Foxb2", "Grhl1", "Foxl1", "Foxd1","Gm5294")
+markerMotifs <- getFeatures(proj4, select = paste(motifs, collapse="|"), useMatrix = "MotifMatrix")
+markerMotifs
+
+
+markerMotifs <- grep("z:", markerMotifs, value = TRUE)
+markerMotifs <- markerMotifs[markerMotifs %ni% "z:SREBF1_22"]
+markerMotifs
+
+
+p <- plotGroups(ArchRProj = proj4, 
+  groupBy = "ClusterBySample", 
+  colorBy = "MotifMatrix", 
+  name = markerMotifs,
+  imputeWeights = getImputeWeights(proj4)
+)
+
+
+p2 <- lapply(seq_along(p), function(x){
+  if(x != 1){
+    p[[x]] + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6) +
+    theme(plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm")) +
+    theme(
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(),
+        axis.title.y=element_blank()
+    ) + ylab("")
+  }else{
+    p[[x]] + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6) +
+    theme(plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm")) +
+    theme(
+        axis.ticks.y=element_blank(),
+        axis.title.y=element_blank()
+    ) + ylab("")
+  }
+})
+
+pdf("Plot-Group-Deviations-w-Imputation_2",  width = 30, height = 8)
+do.call(cowplot::plot_grid, c(list(nrow = 1, rel_widths = c(2, rep(1, length(p2) - 1))),p2))
+dev.off()
+
+
+
+plotPDF(p, name = "Plot-Group-Deviations-w-Imputation_2", width = 10, height = 10, ArchRProj = proj3, addDOC = FALSE)
+
+p <- plotEmbedding(
+    ArchRProj = proj4, 
+    colorBy = "MotifMatrix", 
+    name = sort(markerMotifs), 
+    embedding = "UMAP",
+    imputeWeights = getImputeWeights(proj4)
+)
+
+plotPDF(p, name = "UMAP_Plot_Motifs", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+
+p2 <- lapply(p, function(x){
+    x + guides(color = FALSE, fill = FALSE) + 
+    theme_ArchR(baseSize = 6.5) +
+    theme(plot.margin = unit(c(0, 0, 0, 0), "cm")) +
+    theme(
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank()
+    )
+})
+do.call(cowplot::plot_grid, c(list(ncol = 4),p2))
+pdf("Plot-Groups-Deviations_UMAP_2",  width = 15, height = 20)
+do.call(cowplot::plot_grid, c(list(ncol = 4),p2))
+dev.off()
+
+#14.1 Motif Footprinting
+motifPositions <- getPositions(proj4)
+motifPositions
+
+
+motifs <- c("Smarcc1", "Fos", "Nfkb1", "Bacch1", "Rela", "Nfkb2", "Bach2", "Rel", "Fosb", "Foxb1", "Foxb2", "Grhl1", "Foxl1", "Foxd1","Gm5294")
+markerMotifs <- unlist(lapply(motifs, function(x) grep(x, names(motifPositions), value = TRUE)))
+markerMotifs <- markerMotifs[markerMotifs %ni% "z:SREBF1_22"]
+markerMotifs
+
+proj4 <- addGroupCoverages(ArchRProj = proj4, groupBy = "ClusterBySample", force = TRUE)
+
+
+seFoot <- getFootprints(
+  ArchRProj = proj4, 
+  positions = motifPositions[markerMotifs], 
+  groupBy = "ClusterBySample"
+)
+
+# Normalization of Footprints for Tn5 Bias
+
+# Subtracting the Tn5 Bias
+plotFootprints(
+  seFoot = seFoot,
+  ArchRProj = proj4, 
+  normMethod = "Subtract",
+  plotName = "Footprints-Subtract-Bias",
+  addDOC = FALSE,
+  smoothWindow = 5
+)
+
+
+# Dividing by the Tn5 Bias
+
+plotFootprints(
+  seFoot = seFoot,
+  ArchRProj = proj4, 
+  normMethod = "Divide",
+  plotName = "Footprints-Divide-Bias_Divide",
+  addDOC = FALSE,
+  smoothWindow = 5
+)
+
+
+# Footprinting Without Normalization for Tn5 Bias
+
+plotFootprints(
+  seFoot = seFoot,
+  ArchRProj = proj4, 
+  normMethod = "None",
+  plotName = "Footprints-No-Normalization",
+  addDOC = FALSE,
+  smoothWindow = 5
+)
+
+##### Feature Footprinting
+ proj4<- addGroupCoverages(ArchRProj = proj4, groupBy = "ClusterBySample")  
+
+seTSS <- getFootprints(
+  ArchRProj = proj4, 
+  positions = GRangesList(TSS = getTSS(proj4)), 
+  groupBy = "ClusterBySample",
+  flank = 2000
+)
+
+
+plotFootprints(
+  seFoot = seTSS,
+  ArchRProj = proj4, 
+  normMethod = "None",
+  plotName = "TSS-No-Normalization",
+  addDOC = FALSE,
+  flank = 2000,
+  flankNorm = 100
+)
+
+
+## Plotting browser tracks of Co-accessibility
+markerGenes  <- c("Il6","Cd14", "Tnf", "Rela", "Relb", "Rel","Nfkb1", "Nfkb2", "Tlr1", "Tlr2","Tlr3","Tlr4","Tlr5","Tlr6","Tlr7","Tlr8","Tl9","Tlr11","Tlr12","Tlr13","Tas1r3", "Tas2r102",
+ "Tas1r2", "Tas2r104" , "Tas2r105", "Tas2r106", "Tas2r107", "Tas2r108", "Tas2r109", "Tas2r110", "Tas2r113", "Tas2r114", "Tas2r115", "Tas2r116", "Tas2r117", "Tas2r120", "Tas2r121", "Tas2r122", "Tas2r124", "Tas2r125", "Tas2r129", "Tas2r130", "Tas2r131", "Tas2r134", "Tas2r136", "Tas2r137", "Tas2r138", "Tas2r139", "Tas2r140",
+    "Entpd2", #Type I
+    "Gad1", "Pkd2L1", "Car4", "Snap25", #Type III
+    "Trpm5", "Gnat3", "Tas1r3", "Plcb2", "Pou2f3", "Kcnh2","Calhm1",#Type II
+    #"Shh", "Ascl1", #Precursors
+    "Top2a",  #Proliferating
+    "Krt5", #basal cell
+    "Lgr5",  #Progenitors
+    #"Bcl2", #Dying cells
+    "krt4", "krt13","Krt10", #differenited
+    "Krt15","Sbsn", #differentiating
+    #"krt78", #suprabasal differentiated
+    "krt84", "Krt36" #filiform differentiated cells 
+    )
+
+
+g<-c("Trpm5", "Gnat3", "Plcb2", "Pou2f3", "Kcnh2","Calhm1","Tas1r1",  "Tas1r2","Tas1r3",  "Tas2r102","Tas2r104" , "Tas2r105", "Tas2r106", "Tas2r107", "Tas2r108", "Tas2r109", "Tas2r110", "Tas2r113", "Tas2r114", "Tas2r115", "Tas2r116", "Tas2r117", "Tas2r120", "Tas2r121", "Tas2r122", "Tas2r124", "Tas2r125", "Tas2r129", "Tas2r130", "Tas2r131", "Tas2r134", "Tas2r136", "Tas2r137", "Tas2r138", "Tas2r139", "Tas2r140")
+
+#2
+p <- plotBrowserTrack(
+    ArchRProj = proj4, 
+    groupBy = "Clusters2", 
+    geneSymbol ="Otop1",# c("Entpd2", "Kcnj1"),
+    features =  getMarkers(markersPeaks, cutOff = "FDR <= 0.1 & Log2FC >= 1",returnGR = TRUE)["11.Type III"],
+    upstream = 50000,
+    downstream = 50000
+)
+
+
+p2 <- plotBrowserTrack(
+    ArchRProj = proj4, 
+    groupBy = "Clusters2", 
+    geneSymbol = c("Gad1", "Pkd2L1", "Car4", "Snap25", "Ncam1"),
+    features =  getMarkers(markersPeaks, cutOff = "FDR <= 0.1 & Log2FC >= 1",returnGR = TRUE)["11.Type III"],
+    upstream = 50000,
+    downstream = 50000
+)
+
+p3 <- plotBrowserTrack(
+    ArchRProj = proj4, 
+    groupBy = "Clusters2", 
+    geneSymbol = g,
+    features =  getMarkers(markersPeaks, cutOff = "FDR <= 0.1 & Log2FC >= 1",returnGR = TRUE)["10.Type II"],
+    upstream = 50000,
+    downstream = 50000
+)
+
+
+
+p <- plotBrowserTrack(
+    ArchRProj = proj4, 
+    groupBy = "Clusters2",
+    features = getPeakSet(proj4),
+    geneSymbol = markerGenes, 
+    upstream = 50000,
+    downstream = 50000,
+    loops = getCoAccessibility(proj4)
+)
+
+plotPDF(plotList = p,
+    name = "Otop1_peaks_Type_III.pdf", 
+    ArchRProj = proj, 
+    addDOC = FALSE, width = 8, height = 5)
+
+
+
+
+#####Manuscript Figures
+#############
+### subset PBS data
+idxSample <- BiocGenerics::which(proj$Sample %in% c("Control"))
+cellsSample <- proj$cellNames[idxSample]
+PBSproj <-subsetArchRProject(
+ArchRProj = proj,
+cells = cellsSample,
+outputDirectory = "ArchRSubsetPBSSamples",
+dropCells = TRUE,
+logFile = NULL,
+threads = getArchRThreads(),
+force = TRUE
+)
+
+PBSproj <- addImputeWeights(PBSproj) #subsetAchRProject, no ImputedWeights copied).
+
+remapClust <- c(
+   "C1"="C1-Taste type I",
+   "C2"="C2-von Ebner duct",
+   "C3"="C3-Stem/Progenitor 1",
+   "C4"="C4-Nontaste intermediate 1",
+   "C5"="C5-Nontaste intermediate 2",
+   "C6"="C6-Nontaste cornifying",
+   "C7"="C7-Stem/Progenitor 2",
+   "C8"="C8-Stem/Progenitor 3",
+   "C9"="C9-Langerhans cells",
+   "C10"="C10-Taste type II",
+   "C11"="C11-Taste type III")
+remapClust <- remapClust[names(remapClust) %in% PBSproj$Clusters]
+
+PBSproj$Clusters2 <- mapLabels(PBSproj$Clusters, newLabels = remapClust, oldLabels = names(remapClust))
+
+
+
+p2 <- plotEmbedding(ArchRProj = PBSproj, colorBy = "cellColData", name = "Clusters2", embedding = "UMAP")
+
+#find marker
+markersGS <- getMarkerFeatures(
+    ArchRProj = PBSproj, 
+    useMatrix = "GeneScoreMatrix", 
+    groupBy = "Clusters2",
+    bias = c("TSSEnrichment", "log10(nFrags)"),
+    testMethod = "wilcoxon"
+)
+
+markerList <- getMarkers(markersGS, cutOff = "FDR <= 0.1 & Log2FC >= 0.5")
+
+write.csv(markerList, "markerList_Clusters_PBS_FDR0.1_Log2FC0.5.csv", row.names=F)
+
+
+
+###2021-09-07, call reproduciable peaks for PBS and LPS sample separately.
+
+PBSproj <- addGroupCoverages(ArchRProj = PBSproj, groupBy = "Clusters2",threads =1) #https://github.com/GreenleafLab/ArchR/issues/248
+pathToMacs2 <- findMacs2()
+
+PBSproj2 <- addReproduciblePeakSet(
+    ArchRProj = PBSproj, 
+    groupBy = "Clusters2", 
+    pathToMacs2 = pathToMacs2
+)
+
+
+markersPeaks <- getMarkerFeatures(
+    ArchRProj = PBSproj2, 
+    useMatrix = "PeakMatrix", 
+    groupBy = "Clusters2",
+    bias = c("TSSEnrichment", "log10(nFrags)"),
+    testMethod = "wilcoxon"
+)
+g<-c("Tas1r1",  "Tas1r2","Tas1r3",  "Tas2r102","Tas2r103" ,"Tas2r104", "Tas2r105", "Tas2r106", "Tas2r107", "Tas2r108", "Tas2r109", "Tas2r110", "Tas2r113", "Tas2r114", "Tas2r115", "Tas2r116", "Tas2r117","Tas2r118", "Tas2r119","Tas2r120", "Tas2r121", "Tas2r122", "Tas2r123","Tas2r124", "Tas2r125", "Tas2r126","Tas2r129", "Tas2r130", "Tas2r131", "Tas2r134","Tas2r135" ,"Tas2r136", "Tas2r137", "Tas2r138", "Tas2r139", "Tas2r140","Tas2r143","Tas2r144")
+
+
+
+
+peakset<-getPeakSet(PBSproj2)
+targetgenes<-data.frame(peakset[peakset$nearestGene %in%g,])%>%
+   group_by(nearestGene)%>%
+   summarize(peaks=n())
+
+##############################################################
+###Plot Peaks
+p <- plotBrowserTrack(
+    ArchRProj = PBSproj, 
+    groupBy = "Clusters2", 
+    geneSymbol = g,
+    features =  getMarkers(markersPeaks, cutOff = "FDR <= 0.1 & Log2FC >= 0.5", returnGR = TRUE)["10-Taste type II"],
+    upstream = 50000,
+    downstream = 50000
+)
+plotPDF(plotList = p, 
+    name = "Sweet_Bitter_getCoAccessibility_sample_50kb_PBS_2210907.pdf",
+    ArchRProj = newproj, 
+    addDOC = FALSE, width = 7, height = 5)
+
+
+
+##################################################################
+#Fig3A
+p2 <- plotEmbedding(ArchRProj = PBSproj, colorBy = "cellColData", name = "Clusters2", embedding = "UMAP",labelSize = 6)+scale_color_hue(labels =c("C1-Taste type I",
+    "C2-von Ebner duct",
+    "C3-Stem/Progenitor 1",
+    "C4-Nontaste intermediate 1",
+    "C5-Nontaste intermediate 2",
+    "C6-Nontaste cornifying",
+    "C7-Stem/Progenitor 2",
+    "C8-Stem/Progenitor 3",
+    "C9-Langerhans cells",
+    "C10-Taste type II",
+    "C11-Taste type III"
+    ))+theme(plot.title=element_blank(),
+legend.text=element_text(size=20), legend.title=element_blank(), axis.title=element_text(size=24), legend.position="right")+guides(color=guide_legend(override.aes = list(size=10),ncol=1),plot.margin=unit(c(0,0,0,0),'cm'))
+
+dev.new()
+ggsave(filename="/home/cailu/ArchRSubsetPBSSamples/Fig3A.Clusters_Control.tiff",p2, width =25, height =18, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+ 
+#Fig3B
+"Tas2r114","Tas2r140","Tas2r109", "Tas2r131","Tas2r129","Tas2r106", "Tas2r107",
+"Tas2r130","Tas2r134", "Kcnh2","Pkd2L1", "krt4","Tas2r139", "Calhm1","Tas2r104" , "Tas2r105", "Top2a",   "Krt5",   "Lgr5", "krt13",
+    "Krt15","Sbsn"
+
+markerGenes2  <- c(
+    "Entpd2", "Kcnj1",
+    "Gad1", "Car4", "Snap25","Ncam1", 
+    "Trpm5", "Gnat3", "Tas1r3", "Plcb2", "Pou2f3", 
+    "Tas1r2",  "Tas2r108", "Tas2r110", "Tas2r113",  "Tas2r115", "Tas2r116", "Tas2r117", "Tas2r120", "Tas2r121", "Tas2r122", "Tas2r124", "Tas2r125",    "Tas2r136", "Tas2r137", "Tas2r138"
+    
+    )
+    
+markersGS <- getMarkerFeatures(
+    ArchRProj = PBSproj, 
+    useMatrix = "GeneScoreMatrix", 
+    groupBy = "Clusters",
+    bias = c("TSSEnrichment", "log10(nFrags)"),
+    testMethod = "wilcoxon"
+)
+heatmapGS <- markerHeatmap(
+  seMarker = markersGS, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 1.2", 
+  labelMarkers = markerGenes2,
+  transpose = TRUE
+)
+ComplexHeatmap::draw(heatmapGS, heatmap_legend_side = "bot", annotation_legend_side = "bot")
+plotPDF(heatmapGS, name = "Fig3B.GeneScores_Marker_Heatmap", width = 6, height = 4.5, ArchRProj = LPSproj, addDOC = FALSE)
+dev.off()
+
+dev.new()
+ggsave(filename ='/home/cailu/ArchRSubsetPBSSamples/Fig3B.tiff', heatmapGS,, width =15, height =10, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+Tas1r3, Gnat3, Trpm5, Plcb2, Pou2f3, Calhm1
+Entpd2, Kcnj1, Shh, Gad1, Pkd2l1, Ncam1
+Lgr5, Krt5, Krt14, Mki67, Pcna, Ptch1
+Sbsn, Krt4, Krt10, Krt13, Krt36, Plcb4
+Slc12a2, S100a1, Dmbt1, Cd207, Ptprc, Cd14
+
+
+
+#Fig3C
+markerGenes  <- c(
+    "Tas1r3", "Gnat3",  "Trpm5","Plcb2", "Pou2f3", "Calhm1",
+    "Entpd2", "Kcnj1", "Car4",  "Gad1" , "Pkd2L1","Ncam1",
+     "Lgr5","Krt5", "Krt14", "Mki67", "Pcna", "Ptch1" ,"Sbsn",  "Krt4",
+      "Krt10", "Krt13","Krt36" , "Plcb4", "Slc12a2",
+      "S100a1", "Dmbt1", "Cd207","Ptprc", "Cd14")
+    
+p <- plotEmbedding(
+    ArchRProj = PBSproj, 
+    colorBy = "GeneScoreMatrix", 
+    name = markerGenes, 
+    embedding = "UMAP",
+    imputeWeights = getImputeWeights(PBSproj)
+)
+
+
+#library(colorBlindness)
+#library(paletteer)
+#library(colorspace)
+
+pz<-p[[1]]+
+    theme(legend.title=element_text(size=18),legend.text=element_text(size=14),
+        legend.position="bottom", legend.key.width = unit(1.8, "cm")) +scale_fill_gradientn(colours = 
+        colorspace::diverge_hcl(7),breaks=c(0, 1.2), labels=c("Minimum", "Maximum"), limits=c(0,1.2))+ guides(fill = guide_colourbar(title="Normalized score",title.position="top", title.hjust = .5,label.position = "bottom"))
+ 
+legend <- get_legend(pz)
+ 
+        
+for (i in 1:30){
+ p[[i]]<-p[[i]]+ theme(plot.margin = unit(c(0.1, 0.15, 0.1, 0.15), "cm"))+
+    theme(
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(),
+        plot.title=element_text(hjust=0.5,size=24, face='bold'), 
+        axis.title=element_blank(),
+        legend.position="none"
+    )+ggtitle(markerGenes[i])+scale_fill_gradientn(colours = 
+        colorspace::diverge_hcl(7))
+}
+
+px<-cowplot::plot_grid(p[[1]],p[[2]],p[[3]],p[[4]],p[[5]],p[[6]],p[[7]],p[[8]],p[[9]],p[[10]],p[[11]],p[[12]],p[[13]],p[[14]],p[[15]],p[[16]],p[[17]],p[[18]],p[[19]],p[[20]],p[[21]],p[[22]],p[[23]],p[[24]],p[[25]],p[[26]],p[[27]],p[[28]],p[[29]],p[[30]],ncol=6,scale = 1)
+
+py<-cowplot::plot_grid(px, legend, rel_heights = c(1, .1),ncol=1, align="c",scale = 1)
+
+dev.new()
+pdf(file ='/home/cailu/ArchRSubsetPBSSamples/Fig3C_v3.pdf',width =13, height =14)
+py
+dev.off()
+
+###########################################################
+
+ ##Fig5A, Peak call summary 
+ df<-metadata(PBSproj2@peakSet)$PeakCallSummar
+ 
+#df <-rbind(df,(data.frame(Group=c("C8-Stem/Progenitor 3(n = 6)","C8-Stem/Progenitor 3(n = 6)","C8-Stem/Progenitor 3(n = 6)","C8-Stem/Progenitor 3(n = 6)"), Var1=c("Distal","Exonic", "Intronic", "Promoter"), Freq=c(0,0,0,0))))
+ 
+
+ 
+ df$Group<-factor(df$Group, levels=c("C1-Taste type I(n = 479)" ,                
+ "C2-von Ebner duct(n = 125)" ,  "C3-Stem/Progenitor 1(n = 759)",      
+ "C4-Nontaste intermediate 1(n = 418)","C5-Nontaste intermediate 2(n = 491)",
+ "C6-Nontaste cornifying(n = 389)","C7-Stem/Progenitor 2(n = 392)",      
+"C8-Stem/Progenitor 3(n = 6)","C9-Langerhans cells(n = 67)", "C10-Taste type II(n = 178)" , "C11-Taste type III(n = 120)" , "UnionPeaks" )) 
+
+  
+ p<-ggplot(df, aes(Group, Freq, fill=Var1))+ geom_bar(position="stack", stat="identity")+theme_bw()+theme(panel.grid=element_blank(), axis.text.x=element_text(angle=45, size=14, vjust=1, hjust=1), legend.position="top")+ylab(expression("Number of Peaks (×10"^{3}*")"))+labs(fill="PeakAnno")+theme(axis.title.y=element_text(size=16), axis.title.x=element_blank(), axis.text=element_text(size=12), legend.text=element_text(size=12), legend.title=element_text(size=14))+scale_x_discrete(labels=c("C1-Taste type I" , "C2-von Ebner duct",  "C3-Stem/Progenitor 1", "C4-Nontaste intermediate 1","C5-Nontaste intermediate 2","C6-Nontaste cornifying","C7-Stem/Progenitor 2", "C9-Langerhans cells", "C10-Taste type II" , "C11-Taste type III","UnionPeaks" ))   
+ 
+ggsave(filename="/home/cailu/ArchRSubsetPBSSamples/Fig5A_v2.PeaksSummary.tiff", p, width =15, height =12, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+ dev.off()
+
+#Fig5B
+# To remove the grey background of label, refer to https://github.com/GreenleafLab/ArchR/issues/977
+install_version("ggrepel", version = "0.8.1", repos = "http://cran.us.r-project.org")
+
+
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = PBSproj3, 
+    groupBy = "Clusters2", 
+    geneSymbol = "Trpm5",
+    upstream = 40000,
+    downstream = 40000,
+    plotSummary = c("bulkTrack", "featureTrack", "loopTrack", "geneTrack"),
+  sizes = c(12, 1, 2.5, 3),
+    loops = getCoAccessibility(PBSproj3,corCutOff = 0,
+  resolution = 1, returnLoops = TRUE))
+
+pdf(file="Fig4B_GenomeTrack_Trpm5.pdf",width =11, height =7)
+grid::grid.draw(p$Trpm5)
+dev.off()
+
+
+grid::grid.newpage()
+ggsave(filename="Fig4B_GenomeTrack_Trpm5.tiff",grid::grid.draw(p$Trpm5), width =20, height =14, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+ 
+ 
+ 
+ ##
+pdf(file="Fig4B_GenomeTrack_Trpm5.pdf",width =10, height =7)
+grid::grid.draw(p$Trpm5)
+dev.off()
+ 
+ 
+#Fig5C
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = PBSproj3, 
+    groupBy = "Clusters", 
+    geneSymbol = "Tas1r2",
+    upstream = 38000,
+    downstream = 32000,
+    plotSummary = c("bulkTrack", "featureTrack", "loopTrack", "geneTrack"),
+  sizes = c(12, 1, 2.5, 3),
+    loops = getCoAccessibility(PBSproj3,corCutOff = 0,
+  resolution = 1, returnLoops = TRUE))
+    
+pdf(file="Fig4C.GenomeTrack.Tas1r2.pdf",width =9, height =7)
+grid::grid.draw(p$Tas1r2)
+dev.off()
+  
+    
+grid::grid.newpage()
+ggsave(filename="Fig4C.GenomeTrack.Tas1r2.tiff",grid::grid.draw(p$Tas1r2), width =20, height =16, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+#Fig5D
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = PBSproj3, 
+    groupBy = "Clusters", 
+    geneSymbol = "Tas1r3",
+    tileSize = 125,
+    upstream = 23000,
+    downstream = 8000,
+    plotSummary = c("bulkTrack", "featureTrack", "loopTrack", "geneTrack"),
+  sizes = c(12, 1, 2.5, 3),
+    loops = getCoAccessibility(PBSproj3,corCutOff = 0,
+  resolution = 1, returnLoops = TRUE))
+
+pdf(file="Fig4D.GenomeTrack.Tas1r3.pdf",width =9, height =7)
+grid::grid.draw(p$Tas1r3)
+dev.off()
+  
+
+#Fig5E
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = PBSproj3, 
+    groupBy = "Clusters", 
+    geneSymbol = "Tas2r115",
+    upstream = 50000,
+    downstream = 50000,
+    plotSummary = c("bulkTrack", "featureTrack", "loopTrack", "geneTrack"),
+  sizes = c(12, 1, 2.5, 3),
+    loops = getCoAccessibility(PBSproj3,corCutOff = 0,
+  resolution = 1, returnLoops = TRUE))
+
+pdf(file="Fig4E.GenomeTrack.Tas2r115.pdf",width =9, height =7)
+grid::grid.draw(p$Tas2r115)
+dev.off()
+
+
+#Fig5F
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = PBSproj3, 
+    groupBy = "Clusters", 
+    geneSymbol = "Tas2r113",
+    upstream = 43000,
+    downstream = 50000,
+    plotSummary = c("bulkTrack", "featureTrack", "loopTrack", "geneTrack"),
+  sizes = c(12, 1, 2.5, 3),
+    loops = getCoAccessibility(PBSproj3,corCutOff = 0,
+  resolution = 1, returnLoops = TRUE))
+
+pdf(file="Fig4F.GenomeTrack.Tas2r113.pdf",width =9, height =7)
+grid::grid.draw(p$Tas2r113)
+dev.off()
+
+##Fig5G
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = proj2, 
+    groupBy = "Clusters", 
+    geneSymbol = "Tas1r1",
+    upstream = 50000,
+    downstream = 50000,
+    plotSummary = c("bulkTrack", "featureTrack", "loopTrack", "geneTrack"),
+  sizes = c(12, 1, 2.5, 3),
+    loops = getCoAccessibility(PBSproj3,corCutOff = 0,
+  resolution = 1, returnLoops = TRUE))
+
+pdf(file="Fig4G.GenomeTrack.Tas1r1.pdf",width =9, height =7)
+grid::grid.draw(p$Tas1r1)
+dev.off()
+
+
+#Fig5H
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = PBSproj3, 
+    groupBy = "Clusters", 
+    geneSymbol = "Tas2r137",
+    tileSize = 125,
+    upstream = 25000,
+    downstream = 10000,
+    plotSummary = c("bulkTrack", "featureTrack", "loopTrack", "geneTrack"),
+  sizes = c(12, 1, 2.5, 3),
+    loops = getCoAccessibility(PBSproj3,corCutOff = 0,
+  resolution = 1, returnLoops = TRUE))
+
+pdf(file="Fig5H.GenomeTrack.Tas2r137.pdf",width =9, height =7)
+grid::grid.draw(p$Tas2r137)
+dev.off()
+
+
+
+#############################################################################
+PBSproj2<- addPeakMatrix(PBSproj2)
+getAvailableMatrices(PBSproj2)
+[1] "GeneScoreMatrix" "MotifMatrix"     "PeakMatrix"      "TileMatrix" 
+
+
+PBSproj3<-addCoAccessibility(
+    ArchRProj = PBSproj2,
+    reducedDims = "IterativeLSI"
+)
+
+PBSproj3<- addMotifAnnotations(ArchRProj = PBSproj2, motifSet = "cisbp", name = "Motif")
+
+###############################################################
+
+#Fig6A, Enrichments by clusters
+
+markersPeaks <- getMarkerFeatures(
+    ArchRProj = PBSproj3, 
+    useMatrix = "PeakMatrix", 
+    groupBy = "Clusters2",
+    bias = c("TSSEnrichment", "log10(nFrags)"),
+    testMethod = "wilcoxon")
+
+
+heatmapPeaks <- plotMarkerHeatmap(
+  seMarker = markersPeaks, 
+  cutOff = "FDR <= 0.01 & Log2FC >= 0.5",
+  log2Norm = TRUE,
+  scaleTo = 10^4,
+  scaleRows = TRUE,
+  plotLog2FC = FALSE,
+  limits = c(-2, 2),
+  grepExclude = NULL,
+  pal = NULL,
+  binaryClusterRows = TRUE,
+  clusterCols = TRUE,
+  labelMarkers = NULL,
+  nLabel = 15,
+  nPrint = 15,
+  labelRows = FALSE,
+  returnMatrix = TRUE,
+  transpose = TRUE,
+  invert = FALSE,
+  logFile = createLogFile("plotMarkerHeatmap")
+)
+
+m1<-data.matrix(heatmapPeaks)
+ 
+
+##Fig6A Enrichments
+
+enrichMotifs <- peakAnnoEnrichment(
+    seMarker = markersPeaks,
+    ArchRProj = PBSproj3,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.5 & Log2FC >= 0.3" 
+  )
+
+enrichMotifs
+
+
+heatmapEM <- plotEnrichHeatmap(enrichMotifs, n = 10, transpose = TRUE,labelRows = FALSE,clusterCols=FALSE)
+
+
+p5<-ComplexHeatmap::draw(heatmapEM, heatmap_legend_side = "bot",heatmap_row_names_gp = gpar(fontsize = 20),heatmap_column_names_gp = gpar(fontsize = 20))
+
+pdf("Fig5A.Motif.pdf", width=10, height=4.5)
+p5
+dev.off()
+
+##output with"FDR <= 1 & Log2FC >= 0" N=884
+m2<-assays(enrichMotifs)$mlog10Padj
+write.csv(m2, "Fig5A.Motif.csv")
+
+#, annotation_legend_side = "bot", row_title =NULL,)
+
+plotPDF(heatmapEM, name = "/home/cailu/ArchRSubsetPBSSamples/Figures/Fig6A.pdf", width = 12, height = 12, addDOC = FALSE)
+
+
+m2<-assays(enrichMotifs)$mlog10Padj[rownames(enrichMotifs)%in%c("Foxa1_306","Gm5294_332","Foxl1_355","Mesp2_57",
+"Mesp1_58", "Runx1_712","Runx3_858","Snai2_799","Fos_104","Bach1_108","Trp63_853","Trp73_691","Jund_135",
+"Smarcc1_843", "Bach2_119","Fosb_98","Nfic_724","Nfib_859","Nfia_862","Pit1_623","Pou5f1_618","Lin54_246","Pou3f3_540"),]
+
+m2<-assays(enrichMotifs)$mlog10Padj[rownames(enrichMotifs)%in%c("Foxa1_306","Gm5294_332","Foxl1_355","Mesp2_57",
+"Mesp1_58", "Runx1_712","Runx3_858","Snai2_799","Fos_104","Bach1_108","Trp63_853","Trp73_691","Jund_135",
+"Smarcc1_843", "Bach2_119","Fosb_98","Nfic_724","Nfib_859","Nfia_862","Pit1_623","Pou5f1_618","Lin54_246","Pou3f3_540"),]
+
+m2[m2>100]<-100
+m2<-as.matrix(m2)
+
+## S5 Fig
+ myCol <- colorRampPalette(c('royalblue', 'white', 'red3'))(100)
+  myBreaks <- seq(-2, 2, length.out = 100)
+
+  hmap1 <- Heatmap(m1,
+    name = "Column Z-score",
+    col = colorRamp2(myBreaks, myCol),
+
+    heatmap_legend_param = list(
+      color_bar = 'continuous', 
+      legend_direction = 'horizontal',
+      legend_width = unit(8.9, 'cm'),
+      legend_height = unit(5.0, 'cm'),
+      title_position = 'topcenter',
+      title_gp=gpar(fontsize = 35, fontface = 'bold'),
+      labels_gp=gpar(fontsize = 24, fontface = 'bold')),
+    cluster_rows = FALSE,
+    show_row_dend = FALSE,
+    row_title = NULL,
+    row_title_side = 'left',
+    row_title_gp = gpar(fontsize = 30,  fontface = 'bold'),
+    row_title_rot = 90,
+    show_row_names = TRUE,
+    row_names_side = 'left',
+    row_names_gp = gpar(fontsize = 24,fontface = 'bold'),
+    row_names_max_width=unit(25, 'cm'),
+    row_dend_width = unit(25,'mm'),
+    cluster_columns = FALSE,
+    show_column_dend = FALSE,
+    column_title = 'PeakMatrix, 18042 Features',
+    column_title_side = 'bottom',
+    column_title_gp = gpar(fontsize = 30, fontface = 'bold'),
+    column_title_rot = 0,
+    show_column_names = FALSE,
+    column_names_gp = gpar(fontsize = 14, fontface = 'bold'),
+    column_names_max_height = unit(15, 'cm'),
+    raster_resize_mat = TRUE,
+    
+    clustering_distance_columns = function(x) as.dist(1 - cor(t(x))),
+    clustering_method_columns = 'ward.D2')
+
+ph<-ComplexHeatmap::draw(hmap1, heatmap_legend_side = "top")
+pdf("Peak_heatmap.pdf", width=18, height=12)
+ph 
+dev.off()
+
+
+rownames(m2) <- c("Mesp2","Mesp1","Fosb","Fos","Bach1","Bach2","Jund","Lin54",  "Foxa1","Gm5294", "Foxl1","Pou3f3","Pou5f1","Pit1","Trp73",  "Runx1",   "Nfic",    "Snai2","Smarcc1", "Trp63" ,"Runx3",  "Nfib","Nfia" )
+ 
+
+myCol <- colorRampPalette(c('forestgreen', 'black', 'purple'))(2500)
+myCol <- colorRampPalette(c('grey90', 'darkblue', 'purple','black', 'black',  'black'))(2500)
+
+  myBreaks <- seq(0, 100, length.out = 2500)
+
+  hmap2 <- Heatmap(t(m2),
+     name = "Norm. Enrichment\n −log10(P−adj)\n [0−Max]",
+     col = colorRamp2(myBreaks,myCol),
+
+    heatmap_legend_param = list(
+      color_bar = 'continuous', 
+      at= c(0, 100), 
+        labels = c("0",  "100"),
+      legend_direction = 'vertical',
+      legend_width = unit(8, 'cm'),
+      legend_height = unit(8, 'cm'),
+      title_position = 'leftcenter-rot',
+      title_gp=gpar(fontsize = 30, fontface = 'bold'),
+      labels_gp=gpar(fontsize = 24, fontface = 'bold',labels_just="right")),
+      
+    cluster_rows = FALSE,
+    show_row_dend = FALSE,
+    row_title = NULL,
+    #row_title_gp = gpar(fontsize = 30,  fontface = 'bold'),
+    #row_title_rot = 90,
+    show_row_names = FALSE,
+    row_names_gp = gpar(fontsize = 14, fontface = 'bold'),
+    row_names_side = 'right',
+    cluster_columns = TRUE,
+    show_column_dend = FALSE,
+    column_title = 'Enriched Trancription Factor Motifs',
+    column_title_side = 'bottom',
+    column_title_gp = gpar(fontsize = 30, fontface = 'bold'),
+    column_title_rot = 0,
+    show_column_names = TRUE,
+    column_names_side = 'top',
+    column_names_gp = gpar(fontsize = 24, angle=30, fontface = 'bold'),
+    column_names_max_height = unit(15, 'cm'),
+    #use_raster = TRUE,
+    raster_by_magick = TRUE,
+    rect_gp = gpar(col = "black", lwd = 0.1),
+   
+    clustering_distance_columns = function(x) as.dist(1 - cor(t(x))),
+    clustering_method_columns = 'ward.D2')
+
+
+#library(grid)#libray(ComplexHeatmap), #library(RColorBrewer)#require(circlize)
+#require(digest) #require(cluster)
+
+cairo_pdf("Fig5A.Peak_Motif.pdf", height=14, width=24, onefile = TRUE)
+   pushViewport(viewport(layout = grid.layout(nr = 1, nc = 2,widths=c(1.25,1))))
+    pushViewport(viewport(layout.pos.row = 1, layout.pos.col = 1))
+      draw(hmap1,
+        heatmap_legend_side = 'top',
+        row_sub_title_side = 'left',
+        newpage = FALSE)
+      popViewport()
+
+    pushViewport(viewport(layout.pos.row = 1, layout.pos.col = 2))
+      draw(hmap2 ,
+        heatmap_legend_side = 'right',
+        row_sub_title_side = NULL,
+        newpage = FALSE)
+      popViewport()
+   popViewport()
+dev.off()
+
+
+############################################
+
+
+#Fig6C
+#################################################
+seGroupMotif <- getGroupSE(ArchRProj = PBSproj3, useMatrix = "MotifMatrix", groupBy = "Clusters2")
+
+seZ <- seGroupMotif[rowData(seGroupMotif)$seqnames=="z",]
+
+rowData(seZ)$maxDelta <- lapply(seq_len(ncol(seZ)), function(x){
+  rowMaxs(assay(seZ) - assay(seZ)[,x])
+}) %>% Reduce("cbind", .) %>% rowMaxs
+
+
+##step 2
+
+corGSM_MM <- correlateMatrices(
+    ArchRProj = PBSproj3,
+    useMatrix1 = "GeneScoreMatrix",
+    useMatrix2 = "MotifMatrix",
+    reducedDims = "IterativeLSI"
+)
+
+
+#Step 3. Add Maximum Delta Deviation to the Correlation Data Frame
+corGSM_MM$maxDelta <- rowData(seZ)[match(corGSM_MM$MotifMatrix_name, rowData(seZ)$name), "maxDelta"]
+
+#Step 4. Identify Positive TF Regulators
+corGSM_MM <- corGSM_MM[order(abs(corGSM_MM$cor), decreasing = TRUE), ]
+corGSM_MM <- corGSM_MM[which(!duplicated(gsub("\\-.*","",corGSM_MM[,"MotifMatrix_name"]))), ]
+
+corGSM_MM$TFRegulator <- "NO"
+corGSM_MM$TFRegulator[which(corGSM_MM$cor > 0.5 & corGSM_MM$padj < 0.01 &corGSM_MM$maxDelta > quantile(corGSM_MM$maxDelta, 0.75,na.rm=TRUE))] <- "YES"
+
+sort(corGSM_MM[corGSM_MM$TFRegulator=="YES",1])
+
+#plot
+d<-data.frame(corGSM_MM)%>%
+ distinct(GeneScoreMatrix_name, .keep_all=TRUE)
+d$label<-ifelse(d$TFRegulator=="YES", d$GeneScoreMatrix_name, "")
+p <- ggplot(d, aes(cor, maxDelta, label=label)) +
+  geom_point(color = ifelse(d$label== "", "darkgrey", "firebrick3")) +
+  theme_ArchR()+
+  geom_vline(xintercept = 0, lty = "dashed") + 
+  xlab("Correlation To Gene Score") +
+  ylab("Max TF Motif Delta") +
+  scale_y_continuous(
+    expand = c(0,0), 
+    limits = c(0, max(corGSM_MM$maxDelta)*1.05))+ 
+    geom_text_repel(data=subset(d, TFRegulator=="YES" & cor>0.66),max.overlaps =22,
+    nudge_x      = 1.1-subset(d, TFRegulator=="YES" & cor>0.66)$cor,
+    direction    = "y",
+    hjust        = 0,
+    segment.size = 0.2, color='red')+
+    geom_text_repel(data=subset(d, TFRegulator=="YES" & cor <0.66),max.overlaps =22,
+    nudge_x      = 0.5-subset(d, TFRegulator=="YES" & cor <0.66)$cor,
+    direction    = "y",
+    hjust        = 1,
+    segment.size = 0.2,color='red')+
+    theme(axis.title=element_text(size=24, face='bold'), axis.text=element_text(size=22), legend.position="none")
+
+p
+
+dev.new()
+ggsave(filename="Fig6C.Correlation.tiff",p, width =20, height =20, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+
+
+###############################################
+
+#Fig 6D
+markerGenes<-c("Trp63","Bach1", "Sox2", "Runx1", "Pou1f1", "Pou2f3", "Lin54", "Ascl1")
+
+p1 <- plotEmbedding(
+  ArchRProj = PBSproj3, 
+  colorBy = "GeneScoreMatrix", 
+  name = markerGenes, 
+  embedding = "UMAP", 
+  continuousSet = "horizonExtra", 
+  quantileCut = c(0, 0.999),
+  log2Norm = TRUE
+)
+
+px1<-p1$Trp63+theme(axis.title.x=element_blank(), legend.position="none") + ylab("Trp63")+ggtitle("Gene Score Matrix")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.6 to 1.8"))+theme(plot.title=element_text(face="bold", size=14, hjust=0.5), axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px2<-p1$Bach1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Bach1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.7 to 1.2"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px3<-p1$Sox2+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Sox2")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.9 to 1.7"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px4<-p1$Runx1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Runx1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="1.3 to 2.1"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px5<-p1$Pou1f1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou1f1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.1 to 0.4"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px6<-p1$Pou2f3+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou2f3")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.3 to 1.5"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px7<-p1$Lin54+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Lin54")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.3 to 0.6"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px8<-p1$Ascl1+theme(axis.title.x=element_blank(), plot.title=
+element_blank()) +ylab("Ascl1")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.4 to 1.2"))+theme(axis.title.y=element_text(size=14),legend.text=element_blank(),legend.title=element_blank())+theme(legend.text=element_blank(), legend.title=element_text(size=14),plot.margin = unit(c(0,0,0,0), "cm"))+ guides(fill = guide_colourbar(title="Normalized Scores\nlow                high",  title.position = "top",title.hjust =0.5, barwidth=8))
+
+
+##motif #Fig5C
+markerMotifs<-c("Pou2f3_487", "Ascl1_780",  "Sox2_750",  "Trp63_853", "Nkx22_462", "Gli3_155")
+markerMotifs<-c("Pou3f3_540", "Pou5f1_618",   "Pit1_623",  "Lin54_246", "Foxl1_355","Mesp2_57")
+
+markerMotifs<-c("Trp63_853","Bach1_108", "Sox2_750", "Runx1_712", "Pit1_623", "Pou2f3_487", "Lin54_246", "Ascl1_780")
+
+p2 <- plotEmbedding(
+  ArchRProj = PBSproj3, 
+  colorBy = "MotifMatrix", 
+  name = paste0("z:",markerMotifs), 
+  embedding = "UMAP", 
+  continuousSet = "solarExtra", 
+  quantileCut = c(0.01, 0.99),
+  log2Norm = FALSE
+)  
+
+py1<-p2$`z:Trp63_853`+theme(axis.title=element_blank(), legend.position="none") +ggtitle("Motif Deviation")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-8.0 to 7.0"))+theme(plot.title=element_text(face="bold", size=14, hjust=0.5))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py2<-p2$`z:Bach1_108`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-9.0 to 4.0"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py3<-p2$`z:Sox2_750`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-2.0 to 2.5"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py4<-p2$`z:Runx1_712`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-2.5 to 4.0"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+
+py5<-p2$`z:Pit1_623`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-1.0 to 15"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py6<-p2$`z:Pou2f3_487`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.8 to 0.5"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py7<-p2$`z:Lin54_246`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-1.0 to 6.5"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+
+py8<-p2$`z:Ascl1_780`+theme(axis.title=element_blank(), plot.title=
+element_blank()) +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-1.5 to 3.8"))+theme(legend.text=element_blank(), legend.title=element_text(size=14),plot.margin = unit(c(0,0,0,0), "cm"))+ guides(fill = guide_colourbar(title= "Deviation Scores\nlow                high",  title.position = "top",title.hjust =0.5, barwidth=8))
+
+
+
+pdf(file ='Fig5C_TF_to_GENE.pdf', width =5, height =20,)
+cowplot::plot_grid(px1,py1,px2,py2, px3, py3,px4,py4,px5,py5, px6,py6, px7, py7, px8, py8, ncol = 2,rel_widths=c(1,1,1,1,1,1,1,1),rel_heights=c(1.19,1,1,1,1,1,1,1.5), align=c("v","h"))
+dev.off()
+
+
+
+dev.new()
+ggsave(filename ='Fig6D_TF_to_GENE.tiff',pl, width =10, height =30, units ="cm",dpi = 600, device='tiff', limitsize = TRUE, compression = "lzw")
+dev.off()
+
+#################################################
+
+#Fig6C-F Footprint
+
+
+motifPositions <- getPositions(PBSproj3)
+motifPositions
+
+
+motifs <- c("Pou2f3", "Ascl1", "Sox2", "Trp63", "Nkx22", "Gli3", "Pou5f1", "Pou3f3", "Pit1", "Lin54")
+
+motifs <- c("Trp63","Bach1", "Sox2", "Runx1", "Pit1", "Pou2f3", "Lin54",  "Pou5f1",    "Ascl1", "Snai2", "Foxl1", "Nfib", "Nfia")
+
+markerMotifs <- unlist(lapply(motifs, function(x) grep(x, names(motifPositions), value = TRUE)))
+#markerMotifs <- markerMotifs[markerMotifs %ni% "Sox21_745"]
+markerMotifs
+
+
+
+seFoot <- getFootprints(
+  ArchRProj = PBSproj3, 
+  positions = motifPositions[markerMotifs], 
+  groupBy = "Clusters2"
+)
+
+# Normalization of Footprints for Tn5 Bias and #Subtracting the Tn5 Bias
+
+plotFootprints(
+  seFoot = seFoot,
+  ArchRProj = PBSproj3, 
+  normMethod = "Subtract",
+  plotName = "Fig5D-H.Footprints-Subtract-Bias",
+  baseSize = 14,
+  addDOC = FALSE,
+  height = 9,
+  width=7,
+  smoothWindow = 5
+)
+
+
+
+################################################
+#Fig6A
+
+p1 <- plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "Sample2", embedding = "UMAP",labelSize = 0) +theme(plot.title=element_blank(),legend.text=element_text(size=17), legend.title=element_blank(), legend.position=c(0.155, 0.11), axis.text =element_blank(), axis.title=element_text(size=20), plot.margin=unit(c(0,-.1,0,.2), "cm"))+scale_colour_manual(labels =c("LPS", "PBS"), values=c("#CC3366", "#003366"))+guides(color=guide_legend(override.aes = list(size=7),ncol=1))
+
+p2 <- plotEmbedding(ArchRProj = proj, colorBy = "cellColData", name = "Clusters2", embedding = "UMAP", labelSize = 8)+scale_color_hue(labels =c("C1-Taste type I",
+    "C2-von Ebner duct",
+    "C3-Stem/Progenitor 1",
+    "C4-Nontaste intermediate 1",
+    "C5-Nontaste intermediate 2",
+    "C6-Nontaste cornifying",
+    "C7-Stem/Progenitor 2",
+    "C8-Stem/Progenitor 3",
+    "C9-Langerhans cells",
+    "C10-Taste type II",
+    "C11-Taste type III"
+    ))+theme(plot.title=element_blank(),
+legend.text=element_text(size=17), legend.title=element_blank(), axis.title.y=element_blank(),axis.title.x=element_text(size=20), legend.position="right", plot.margin=unit(c(0,.1,0,0), "cm"))+guides(color=guide_legend(override.aes = list(size=7),ncol=1))
+
+ggAlignPlots(p1, p2,sizes=c(1,1), type = "h")
+
+
+pdf("Fig6A_Plot-UMAP_2.pdf", width = 11, height = 4, onefile=F) #6A
+ggAlignPlots(p1, p2, type = "h")
+dev.off()
+
+
+
+##############################################################
+#Fig6B
+
+d<-data.frame(table(proj$Clusters2, proj$Sample2))
+ 
+pbs<-subset(d,Var2=="PBS")
+pbs$value<-pbs$Freq/sum(pbs$Freq)
+
+lps<-subset(d,Var2=="LPS")
+lps$value<-lps$Freq/sum(lps$Freq)
+
+d1<-bind_rows(pbs, lps)
+
+d1$Var1<-factor(d1$Var1, levels=c("C1-Taste type I", "C2-von Ebner duct","C3-Stem/Progenitor 1","C4-Nontaste intermediate 1", "C5-Nontaste intermediate 2", "C6-Nontaste cornifying", "C7-Stem/Progenitor 2","C8-Stem/Progenitor 3","C9-Langerhans cells","C10-Taste type II","C11-Taste type III"))                     
+
+p<-ggplot(d1,aes(Var2, value, fill=Var1, label= Freq ))+geom_bar(position="stack", stat="identity",color = "grey", width=0.4) + theme_classic2()+ylab("Percent by Cell Cluster")+ ggtitle("Cells")+
+theme(axis.text.y=element_text(size=12, face="bold"),axis.text.x=element_text(size=14, face="bold"),axis.ticks.x=element_blank(), axis.title.x=element_blank(), axis.title.y=element_text(size=14, face="bold"),legend.title=element_blank(), legend.text=element_text(size=12),plot.title=element_text(size=16, hjust=0.5,face="bold"))+scale_x_discrete(limits =c("PBS","LPS"))+scale_y_continuous(expand = c(0, 0), breaks=c(0,0.25, 0.5, 0.75, 1), labels=c(0,25,50,75,100),limits = c(0, NA))+geom_area(
+    data = ~ d1,
+    aes(x = c("LPS" = 1.8, "PBS" = 1.2)[as.character(Var2)]),
+    position = "stack", outline.type = "both", alpha = 0, colour = "black"
+  ) #+geom_text(size = 3, position = position_stack(vjust = 0.5))
+
+ggsave(filename="Fig6B.CellvaryBySample.tiff",p, width =12, height =10, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+#############
+
+#Fig6B (addition barplot comparing peaks between PBS vs LPS across clusters.
+
+proj3 <- addCellColData(ArchRProj = proj3, data = paste0(proj3@cellColData$Clusters2,"_x_",proj3@cellColData$Sample2), name = "ClusterBySample", cells = getCellNames(proj3), force = TRUE)
+head(proj3@cellColData$ClusterBySample)
+
+#method1 call_peaks
+pathToMacs2 <- findMacs2()
+proj4<- addGroupCoverages(ArchRProj = proj3, groupBy = "ClusterBySample")
+proj4 <- addReproduciblePeakSet(
+    ArchRProj = proj4, 
+    groupBy = "ClusterBySample", 
+    pathToMacs2 = pathToMacs2
+)
+
+#method2 call peaks
+proj4Temp <- addReproduciblePeakSet(
+    ArchRProj = proj4, 
+    groupBy = "ClusterBySample",
+    peakMethod = "Tiles",
+    method = "p"
+)
+
+# Comparing the two peak calling methods
+#irst, we check the percent of MACS2-called peaks that are overlapped by the TileMatrix-called peaks
+length(subsetByOverlaps(getPeakSet(proj4), getPeakSet(proj4Temp))) / length(getPeakSet(proj4))
+#[1] 0.9294865
+
+#Then, we check the converse - the percent of TileMatrix-called peaks that are overlapped by MACS2-called peaks. You can see that this overlap is not as strong.
+length(subsetByOverlaps(getPeakSet(proj4Temp), getPeakSet(proj4))) / length(getPeakSet(proj4Temp))
+#[1] 0.6205412
+
+
+#f we increase the margins of the peaks to be wider (1000-bp peaks instead of 500-bp peaks), the percent of MACS2-called peaks that are overlapped does not change much.
+length(subsetByOverlaps(resize(getPeakSet(proj4), 1000, "center"), getPeakSet(proj4Temp))) / length(getPeakSet(proj4))
+#[1] 0.9357727
+
+#But the percent of TileMatrix-called peaks overlapped by MACS2 does increase.
+length(subsetByOverlaps(getPeakSet(proj4Temp), resize(getPeakSet(proj4), 1000, "center"))) / length(getPeakSet(proj4Temp))
+#[1] 0.7090321
+
+###We used MACS2 and  Add Peak Matrix
+
+proj4<-addPeakMatrix(proj4)
+ 
+getPeakSet(proj4)
+
+
+markersPeaks <- getMarkerFeatures(
+    ArchRProj = proj4, 
+    useMatrix = "PeakMatrix", 
+    groupBy = "ClusterBySample",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  testMethod = "wilcoxon"
+)
+
+
+ df<-metadata(proj4@peakSet)$PeakCallSummar
+
+#refer to https://github.com/GreenleafLab/ArchR/discussions/821
+However, its worth noting that peak calls are extremely sensitive to sequencing depth and data quality and comparing raw peak calls is often dubious.
+
+############################################################################
+##using summary peaksets
+peakset<-metadata(proj4@peakSet)$PeakCallSummar%>%
+     filter(Group !="UnionPeaks")%>%
+     separate(Group, c("cluster", "sample"), sep="_x_")
+     
+peakset$sample<-ifelse(gsub("^PBS.*", "PBS", peakset$sample)=="PBS", "PBS", "LPS")
+
+peakset<-peakset%>%
+  group_by(cluster, sample)%>%
+   summarise(values=sum(Freq*1000))%>%
+   pivot_wider(names_from=sample, values_from=values)
+peakset$PBS.fre<-peakset$PBS/sum(peakset$PBS, na.rm=TRUE)
+peakset$LPS.fre<-peakset$LPS/sum(peakset$LPS)
+
+peakset1<-peakset%>%
+           select(cluster, PBS.fre, LPS.fre)%>%
+                     gather(key, value,-cluster)%>%
+                         mutate(key=recode(key, "PBS.fre"="PBS","LPS.fre"="LPS"))
+
+peakset2<-peakset%>%
+           select(cluster, PBS, LPS)%>%
+                     gather(key, value2,-cluster)
+peakset3<-merge(peakset1, peakset2, by=c("cluster", "key"))    
+
+peakset3[is.na(peakset3)]<-0
+                     
+peakset3$cluster<-factor(peakset3$cluster, levels=c("C1-Taste type I", "C2-von Ebner duct","C3-Stem/Progenitor 1","C4-Nontaste intermediate 1", "C5-Nontaste intermediate 2", "C6-Nontaste cornifying", "C7-Stem/Progenitor 2","C8-Stem/Progenitor 3","C9-Langerhans cells","C10-Taste type II","C11-Taste type III"))                     
+
+p1<-ggplot(peakset3,aes(key, value, fill=cluster, label=value2))+geom_bar(position="stack", stat="identity",color = "grey", width=0.4) + theme_classic2()+ ggtitle("Peaks")+
+theme(axis.text.x=element_text(size=14, face="bold"), axis.title.x=element_blank(), axis.title.y=element_blank(),axis.text.y=element_blank(),plot.title=element_text(size=16, hjust=0.5,face="bold"), axis.ticks.x=element_blank(),
+        axis.ticks.y=element_blank(), axis.line.y=element_blank(),legend.title=element_blank(), legend.text=element_text(size=12))+scale_x_discrete(limits =c("PBS","LPS"))+ scale_y_continuous(expand = c(0, 0), limits = c(0, NA))+geom_area(
+    data = ~ peakset3,
+    aes(x = c("LPS" = 1.8, "PBS" = 1.2)[as.character(key)]),
+    position = "stack", outline.type = "both", alpha = 0, colour = "black"
+  ) #+geom_text(size = 3, position = position_stack(vjust = 0.5))
+
+
+
+library(patchwork)
+p2<-p+p1+theme(legend.position="right")+plot_layout(guides="collect")
+
+dev.new()
+ggsave(filename="Fig6B.Cells.percentPeaksclusterbysample.tiff",p2, width =20, height =10, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+#######################################################################
+
+#######################################################################
+####
+Fig7C-E: C1, C3 &C7 upand down regulate genes
+
+#11.3 Pairwise Testing Between Groups
+proj3 <- addCellColData(ArchRProj = proj3, data = paste0(proj3@cellColData$Clusters2,"_x_",proj3@cellColData$Sample), name = "ClusterBySample", cells = getCellNames(proj3))
+
+##
+
+
+markerTest1 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "C1-Taste type I_x_LPS",
+  bgdGroups = "C1-Taste type I_x_Control"
+)
+markerList1 <- getMarkers(markerTest1, cutOff = "FDR < 0.05 & abs(Log2FC) > .5", returnGR = FALSE)
+markerList1
+
+
+
+markerTest3 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "C3-Stem/Progenitor 1_x_LPS",
+  bgdGroups = "C3-Stem/Progenitor 1_x_Control"
+)
+markerList3 <- getMarkers(markerTest3, cutOff = "FDR < 0.05 & abs(Log2FC) > .5", returnGR = FALSE)
+markerList3
+
+
+markerTest7 <- getMarkerFeatures(
+  ArchRProj = proj3,
+  useMatrix = "GeneScoreMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "C7-Stem/Progenitor 2_x_LPS",
+  bgdGroups = "C7-Stem/Progenitor 2_x_Control"
+)
+markerList7 <- getMarkers(markerTest7, cutOff = "FDR < 0.05 & abs(Log2FC) > .5", returnGR = FALSE)
+markerList7
+
+
+markerList<-c(markerList1,markerList3,markerList7)
+
+write.csv(markerList, "markerPeaks_Up_Fig6C_E.csv", row.names=F)
+
+
+pma1 <- markerPlot(seMarker = markerTest1, name = "C1-Taste type I_x_LPS", cutOff = "FDR <= 0.05 & abs(Log2FC) >= .5", plotAs = "MA")+theme(legend.text=element_text(size=9), legend.title=element_blank(), axis.title=element_text(size=14, face='bold'), axis.text=element_text(size=12, face='bold'), plot.margin = margin(-20, 0, 1, 0, "pt"), legend.position=c(0.73, 0.15), plot.title = element_text(vjust = - 19, hjust=.95, size=9))+guides(colour = guide_legend(override.aes = list(size=2.5), nrow=3))
+
+dev.new()
+ggsave(filename="Fig6C.PMA_C1.tiff",pma1, width =11, height =11, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+ 
+
+pma3 <- markerPlot(seMarker = markerTest3, name = "C3-Stem/Progenitor 1_x_LPS", cutOff = "FDR <= 0.05 & abs(Log2FC) >= .5", plotAs = "MA")+ theme(legend.text=element_text(size=9), legend.title=element_blank(), axis.title=element_text(size=14, face='bold'), axis.text=element_text(size=12, face='bold'), plot.margin = margin(-20, 0, 1, 0, "pt"), legend.position=c(0.73, 0.15), plot.title = element_text(vjust = - 19, hjust=.95, size=9))+guides(colour = guide_legend(override.aes = list(size=2.5), nrow=3))
+
+dev.new()
+ggsave(filename="Fig6D.PMA_C3.tiff",pma3, width =10, height =10, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+pma7 <- markerPlot(seMarker = markerTest7, name = "C7-Stem/Progenitor 2_x_LPS", cutOff = "FDR <= 0.05 & abs(Log2FC) >= .5", plotAs = "MA")+ theme(legend.text=element_text(size=9), legend.title=element_blank(), axis.title=element_text(size=14, face='bold'), axis.text=element_text(size=12, face='bold'), plot.margin = margin(-20, 0, 1, 0, "pt"), legend.position=c(0.73, 0.15), plot.title = element_text(vjust = - 19, hjust=.95, size=9))+guides(colour = guide_legend(override.aes = list(size=2.5), nrow=3))
+
+dev.new()
+ggsave(filename="Fig6E.PMA_C7.tiff",pma7, width =10, height =10, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+
+plotPDF(pma1,  name = "Fig7C_Controlvs-LPS-Markers-MA-Volcano_C1", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma3,  name = "Fig7D_Controlvs-LPS-Markers-MA-Volcano_C3", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+plotPDF(pma7,  name = "Fig7E_Controlvs-LPS-Markers-MA-Volcano_C7", width = 5, height = 5, ArchRProj = proj3, addDOC = FALSE)
+
+
+##
+d<-data.frame(getMarkers(markerTest1,cutOff = "FDR <= 1 & abs(Log2FC) >=0", returnGR = FALSE))
+c1<-ggmaplot(subset(d, baseMean<2),main = expression("Group 1" %->% "Group 2"),
+   fdr = 0.05, fc = 0.5, size = 0.4,
+   palette = c("#B31B21", "#1465AC", "darkgray"),
+   genenames = as.vector(d$name),
+   legend = "top", top = 20,
+   font.label = c("bold", 11),
+   font.legend = "bold",
+   font.main = "bold",
+   ggtheme = ggplot2::theme_minimal())
+##############################################################
+Fig7F-H
+
+proj4<- addMotifAnnotations(ArchRProj = proj3, motifSet = "cisbp", name = "Motif")
+
+markerTest1 <- getMarkerFeatures(
+  ArchRProj = proj4,
+  useMatrix = "PeakMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "C1-Taste type I_x_LPS",
+  bgdGroups = "C1-Taste type I_x_PBS"
+)
+markerList1 <- getMarkers(markerTest1, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList1
+
+markerTest3 <- getMarkerFeatures(
+  ArchRProj = proj4,
+  useMatrix = "PeakMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "C3-Stem/Progenitor 1_x_LPS",
+  bgdGroups = "C3-Stem/Progenitor 1_x_PBS"
+)
+markerList3 <- getMarkers(markerTest3, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList3
+
+
+markerTest7 <- getMarkerFeatures(
+  ArchRProj = proj4,
+  useMatrix = "PeakMatrix",
+  groupBy = "ClusterBySample",
+  testMethod = "wilcoxon",
+  bias = c("TSSEnrichment", "log10(nFrags)"),
+  useGroups = "C7-Stem/Progenitor 2_x_LPS",
+  bgdGroups = "C7-Stem/Progenitor 2_x_PBS"
+)
+markerList7 <- getMarkers(markerTest7, cutOff = "FDR < 0.1 & abs(Log2FC) > 0.5", returnGR = FALSE)
+markerList7
+
+
+markerList<-c(markerList1,markerList3,markerList7)
+
+write.csv(markerList, "Motif_Up_Fig7F_H.csv", row.names=F)
+
+###########################
+
+motifsUp <- peakAnnoEnrichment(
+    seMarker = markerTest1,
+    ArchRProj = proj4,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.1 & Log2FC >= 0.5"
+  )
+  
+df <- data.frame(TF = rownames(motifsUp), mlog10Padj = assay(motifsUp)[,1])
+df <- df[order(df$mlog10Padj, decreasing = TRUE),]
+df$rank <- seq_len(nrow(df))
+  
+  
+  ggUp <- ggplot(df, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 1) +
+  ggrepel::geom_label_repel(
+        data = df[rev(seq_len(30)), ], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 1.5,
+        nudge_x = 2,
+        color = "black"
+  ) + theme_ArchR() + 
+  ylab("-log10(P-adj) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = paletteContinuous(set = "comet"))
+
+ggUp
+
+
+plotPDF(ggUp,name = "Fig6F_Motifs-Enriched_C1", width = 4, height = 4, ArchRProj = proj, addDOC = FALSE)
+
+##
+motifsUp <- peakAnnoEnrichment(
+    seMarker = markerTest3,
+    ArchRProj = proj4,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.1 & Log2FC >= 0.5"
+  )
+  
+df <- data.frame(TF = rownames(motifsUp), mlog10Padj = assay(motifsUp)[,1])
+df <- df[order(df$mlog10Padj, decreasing = TRUE),]
+df$rank <- seq_len(nrow(df))
+  
+  
+  ggUp <- ggplot(df, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 1) +
+  ggrepel::geom_label_repel(
+        data = df[rev(seq_len(30)), ], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 1.5,
+        nudge_x = 2,
+        color = "black"
+  ) + theme_ArchR() + 
+  ylab("-log10(P-adj) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = paletteContinuous(set = "comet"))
+
+ggUp
+
+
+plotPDF(ggUp,name = "Fig6G_Motifs-Enriched_C3", width = 4, height = 4, ArchRProj = proj, addDOC = FALSE)
+
+
+##Fig6H
+motifsUp <- peakAnnoEnrichment(
+    seMarker = markerTest7,
+    ArchRProj = proj4,
+    peakAnnotation = "Motif",
+    cutOff = "FDR <= 0.1 & Log2FC >= 0.5"
+  )
+  
+df <- data.frame(TF = rownames(motifsUp), mlog10Padj = assay(motifsUp)[,1])
+df <- df[order(df$mlog10Padj, decreasing = TRUE),]
+df$rank <- seq_len(nrow(df))
+  
+  
+  ggUp <- ggplot(df, aes(rank, mlog10Padj, color = mlog10Padj)) + 
+  geom_point(size = 1) +
+  ggrepel::geom_label_repel(
+        data = df[rev(seq_len(30)), ], aes(x = rank, y = mlog10Padj, label = TF), 
+        size = 1.5,
+        nudge_x = 2,
+        color = "black"
+  ) + theme_ArchR() + 
+  ylab("-log10(P-adj) Motif Enrichment") + 
+  xlab("Rank Sorted TFs Enriched") +
+  scale_color_gradientn(colors = paletteContinuous(set = "comet"))
+
+ggUp
+
+
+plotPDF(ggUp,name = "Fig6H_Motifs-Enriched_C7", width = 4, height = 4, ArchRProj = proj, addDOC = FALSE)
+
+
+
+
+
+
+##################################################
+#Fig9A  2bars
+peakset<-getPeakSet(proj2)
+
+d<-data.frame(peakset)%>%
+  dplyr::filter(seqnames=="chr6"&start >= 132730000 &
+  seqnames=="chr6"&end <= 132831000 |
+  seqnames=="chr6"&start >= 132831000 &
+  seqnames=="chr6"&end <= 132920000 )%>%
+  tidyr::separate(GroupReplicate, c("cluster", "sample"), sep="._.")%>%
+   dplyr::group_by(sample)%>%
+   dplyr::summarize(peaks=dplyr::n())%>%
+   dplyr::mutate(sample=dplyr::recode(sample, "Control"="PBS"))
+
+d$sample<-factor(d$sample, level=c("PBS", "LPS"))
+p <- ggplot(d, aes(x=sample, y=peaks)) +
+  geom_col(position=position_dodge(), fill=c("#0077b6", "#F8766D"),width = .3)  + ylab("Number of Peaks")+ggtitle("Chr6:132730-132920kb")+
+  theme_minimal()+theme(axis.text = element_text( size=16), axis.title.y=element_text(size=16, face='bold'), plot.title=element_text(size=18, hjust=0.5, face='bold'), legend.position="none", axis.title.x=element_blank())
+  
+ 
+
+pdf(file="Fig7A.Peaks_barplot.pdf",width =3.5, height =4)
+grid::grid.draw(p)
+dev.off()
+
+
+  
+ 
+ 
+ 
+################################################
+ 
+ #Fig9B
+g<-c( "Tas2r102","Tas2r103" ,"Tas2r104", "Tas2r105", "Tas2r106", "Tas2r107", "Tas2r108", "Tas2r109", "Tas2r110", "Tas2r113", "Tas2r114", "Tas2r115", "Tas2r116", "Tas2r117","Tas2r118", "Tas2r119","Tas2r120", "Tas2r121", "Tas2r122", "Tas2r123","Tas2r124", "Tas2r125", "Tas2r126","Tas2r129", "Tas2r130", "Tas2r131", "Tas2r134","Tas2r135" ,"Tas2r136", "Tas2r137", "Tas2r138", "Tas2r139", "Tas2r140","Tas2r143","Tas2r144")
+
+
+peakset<-getPeakSet(proj)
+targetgenes<-data.frame(peakset[peakset$nearestGene %in%g,])%>%
+   separate(GroupReplicate, c("cluster", "sample"), sep="._.")%>%
+   group_by(sample, nearestGene)%>%
+   summarize(peaks=n())%>%
+   mutate(sample=recode(sample, "Control"="PBS"))%>%
+   filter(sample !="Rep2")%>%
+   pivot_wider(names_from=sample, values_from=peaks)
+   
+#targetgenes$LPS[is.na(targetgenes$LPS)==TRUE]<-0  
+#targetgenes$PBS[is.na(targetgenes$PBS)==TRUE]<-0  
+
+targetgenes<-targetgenes%>%
+      gather(sample, peaks, -nearestGene)
+      
+targetgenes$nearestGene <- factor(targetgenes$nearestGene, level= c("Tas2r131",	"Tas2r110",	"Tas2r105",	"Tas2r104",	"Tas2r103",	"Tas2r117",	"Tas2r106",	"Tas2r125",	"Tas2r122",	"Tas2r116",	"Tas2r129",	"Tas2r124",	"Tas2r121",	"Tas2r114",	"Tas2r102",	"Tas2r144",	"Tas2r143",	"Tas2r138",	"Tas2r134",	"Tas2r118",	"Tas2r136",	"Tas2r108",	"Tas2r140",	"Tas2r130",	"Tas2r113",	"Tas2r109",	"Tas2r107",	"Tas2r137",	"Tas2r135",	"Tas2r115",	"Tas2r126",	"Tas2r119"))      
+
+
+
+red <-c("Tas2r131",	"Tas2r110",	"Tas2r105",	"Tas2r104",	"Tas2r103",	"Tas2r117",	"Tas2r106",	"Tas2r125",	"Tas2r122",	"Tas2r116",	"Tas2r129",	"Tas2r124",	"Tas2r121",	"Tas2r114",	"Tas2r102",	"Tas2r144",	"Tas2r143",	"Tas2r138",	"Tas2r134",	"Tas2r118")
+
+
+cols <- c( "#F8766D", "#F8766D", "#F8766D", "#F8766D", "#F8766D", "#F8766D", "#F8766D", "#F8766D", "#F8766D", "#F8766D", "#F8766D", "#F8766D", "#F8766D","#F8766D","#F8766D","#F8766D","#F8766D",  "#F8766D","#F8766D", "#F8766D",  "#619CFF",  "#619CFF",  "#619CFF",  "#619CFF",  "#619CFF",  "#619CFF",  "#619CFF",  "#619CFF",  "#619CFF",  "#619CFF",  "#619CFF",  "#619CFF" )
+
+##version2
+p <- ggplot(targetgenes, aes(x=nearestGene, y=peaks, fill=sample)) +
+  geom_col(position=position_dodge())  +
+  theme_minimal()+theme(axis.text.x = element_text(color = cols, angle=90, hjust=1, vjust=0.5, size=14), axis.text.y = element_text(size=14),axis.title.y=element_text(size=16), legend.title=element_blank(), legend.text=element_text(size=14), legend.position="top", axis.title.x=element_blank())+geom_segment(aes(x = 0, y = 0, xend = 0, yend = 12.5),colour = "black")+geom_segment(aes(x = 0, y = 12.5, xend = 20.5, yend = 12.5),colour = "black")+geom_segment(aes(x = 20.5, y = 0,xend = 20.5, yend = 12.5),colour = "black")+coord_cartesian(xlim=c(0,33), ylim=c(0,17), clip="off")+annotate("segment", x = 0, xend = 20.5, y = -4.5, yend = -4.5)+annotate("segment", x = 20.5, xend = 20.5, y = 0, yend = -4.5)+annotate("segment", x = 0, xend = 0, y = 0, yend = -4.5)+ylab("Number of peaks")+scale_y_continuous(expand = c(0, 0))+annotate("text", x = 10, y = 13.5, label="Number of peaks: LPS/PBS=242%", size=5)
+  
+  
+
+pdf(file="Fig7A.Peaks_t2r.pdf",width =8, height =5)
+grid::grid.draw(p)
+dev.off()
+
+
+
+
+
+
+##
+p<-ggplot(targetgenes,aes(peaks, sample, fill=nearestGene, label=peaks))+geom_bar(color="grey",position="stack",stat="identity") + theme_classic2()+xlab("Number of Peaks for Bitter Taste Receptor Genes")+geom_text(size = 3, position = position_stack(vjust = 0.5))+theme(axis.text.y=element_text(size=14, face="bold", angle=90, hjust=0.5), axis.title.y=element_blank(), axis.title.x=element_text(size=14, face="bold"),legend.title=element_blank(), legend.text=element_text(size=12), legend.position="top")+scale_y_discrete(limits =c("PBS","LPS"), labels=c("PBS\n(100%)","LPS\n(125%)"))+guides(fill = guide_legend(reverse = TRUE, ncol=8))+scale_x_continuous(expand = c(0, 0))
+
+
+
+dev.new()
+ggsave(filename="Fig9A.PeakGenes.tiff",p, width =19, height =10, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+ 
+
+
+
+
+
+
+#########################################################################
+Fig9B
+
+
+##change color
+##proj$Sample2<-factor(proj$Sample2, level=c( "2-LPS", "1-PBS"))
+
+p <- plotBrowserTrack(
+    baseSize=3,
+    facetbaseSize = 8,
+    ArchRProj = proj, 
+    groupBy = "Sample2",
+    geneSymbol = "Tas2r110",
+    plotSummary = c("bulkTrack",  "geneTrack"),
+    sizes=c(1,1),
+    upstream = 23007,
+    downstream = 51992,
+    ylim=0.99
+)
+
+
+grid::grid.newpage()
+plotPDF(p, name = "Fig7C.PBSvsLPSGenomeTrack.Tas2r110.pdf",width =8, height =2, ArchRProj = proj, addDOC = FALSE)
+
+
+#############add filters
+p <- plotBrowserTrack(
+    baseSize=3,
+    facetbaseSize = 8,
+    ArchRProj = proj, 
+    groupBy = "Sample2", 
+    geneSymbol = "Tas2r124",
+    plotSummary = c("bulkTrack", "geneTrack"),
+    sizes=c(1,1),
+    upstream = 24729,
+    downstream = 51270)
+
+
+grid::grid.newpage()
+plotPDF(p, name = "Fig7B.PBSvsLPSGenomeTrack.Tas2r124.pdf",width =8, height =2, ArchRProj = proj, addDOC = FALSE)
+
+
+
+
+####
+g<-c( "Tas2r102","Tas2r103" ,"Tas2r104", "Tas2r105", "Tas2r106", "Tas2r107", "Tas2r108", "Tas2r109", "Tas2r110", "Tas2r113", "Tas2r114", "Tas2r115", "Tas2r116", "Tas2r117","Tas2r118", "Tas2r119","Tas2r120", "Tas2r121", "Tas2r122", "Tas2r123","Tas2r124", "Tas2r125", "Tas2r126","Tas2r129", "Tas2r130", "Tas2r131", "Tas2r134","Tas2r135" ,"Tas2r136", "Tas2r137", "Tas2r138", "Tas2r139", "Tas2r140","Tas2r143","Tas2r144")
+
+p <- plotBrowserTrack(
+    ArchRProj = proj3, 
+    groupBy = "Sample2", 
+    geneSymbol = g,
+    features =  getMarkers(markersPeaks, cutOff = "FDR <= 0.1 & Log2FC >= .5", returnGR = TRUE)["C10"],
+     tileSize = 125,
+    upstream = 50000,
+    downstream = 50000
+)
+
+pdf(file="Fig7.PBSvsLPSGenomeTrack.Tas2rs.pdf",width =6, height =4.5)
+grid::grid.draw(p)
+dev.off()
+
+grid::grid.newpage()
+plotPDF(p, name = "Fig7.PBSvsLPSGenomeTrack.Tas2rs", width = 6, height = 4.5, ArchRProj = proj3, addDOC = FALSE)
+
+
+
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = proj, 
+    groupBy = "Sample", 
+    minCells = 25,
+    geneSymbol = "Tas1r3",
+    tileSize =250,
+    upstream = 23007,
+    downstream = 49992
+)
+
+##################################################################
+
+plotTrajectoryHeatmap(
+  seTrajectory = getTrajectory(PBSproj3),
+  varCutOff = 0.9,
+  maxFeatures = 25000,
+  scaleRows = TRUE,
+  limits = c(-1.5, 1.5),
+  grepExclude = NULL,
+  pal = NULL,
+  labelMarkers = NULL,
+  labelTop = 50,
+  labelRows = FALSE,
+  rowOrder = NULL,
+  useSeqnames = NULL,
+  returnMatrix = FALSE,
+  force = FALSE,
+  logFile = createLogFile("plotTrajectoryHeatmap")
+)
+getTrajectory(PBSproj3)
+
+
+#################################################
+#suppletemental Table
+
+###Fig s5g
+markerGenes<-c("Pou3f3", "Pou5f1","Nkx2-2", "Gli3")
+
+p1 <- plotEmbedding(
+  ArchRProj = PBSproj3, 
+  colorBy = "GeneScoreMatrix", 
+  name = markerGenes, 
+  embedding = "UMAP", 
+  continuousSet = "horizonExtra", 
+  quantileCut = c(0, 0.999),
+  log2Norm = TRUE
+)
+
+px1<-p1$Pou3f3+theme(axis.title.x=element_blank(), legend.position="none") + ylab("Pou3f3")+ggtitle("Gene Score Matrix")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.05 to 0.45"))+theme(plot.title=element_text(face="bold", size=14, hjust=0.5), axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))
+
+px2<-p1$Pou5f1+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Pou5f1")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.05 to 0.30"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px3<-p1$`Nkx2-2`+theme(axis.title.x=element_blank(), plot.title=
+element_blank(),legend.position="none") +ylab("Nkx2.2")+
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.30 to 0.90"))+theme(axis.title.y=element_text(size=14))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+px4<-p1$Gli3+theme(axis.title.x=element_blank(), plot.title=
+element_blank()) +ylab("Gli3")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="0.70 to 1.35"))+theme(axis.title.y=element_text(size=14),legend.text=element_blank(),legend.title=element_blank())+theme(legend.text=element_blank(), legend.title=element_text(size=14),plot.margin = unit(c(0,0,0,0), "cm"))+ guides(fill = guide_colourbar(title="Normalized Scores\nlow                high",  title.position = "top",title.hjust =0.5, barwidth=8))
+
+
+##motif #SFig5C
+markerMotifs<-c( "Pou3f3_540", "Pou5f1_618","Nkx22_462", "Gli3_155")
+
+
+p2 <- plotEmbedding(
+  ArchRProj = PBSproj3, 
+  colorBy = "MotifMatrix", 
+  name = paste0("z:",markerMotifs), 
+  embedding = "UMAP", 
+  continuousSet = "solarExtra", 
+  quantileCut = c(0.01, 0.99),
+  log2Norm = FALSE
+)  
+
+py1<-p2$`z:Pou3f3_540`+theme(axis.title=element_blank(), legend.position="none") +ggtitle("Motif Deviation")+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-1.0 to 3.2"))+theme(plot.title=element_text(face="bold", size=14, hjust=0.5))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py2<-p2$`z:Pou5f1_618`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.5 to 6.5"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py3<-p2$`z:Nkx22_462`+theme(axis.title=element_blank(), plot.title=
+element_blank(),legend.position="none") +
+geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-0.6 to 0.4"))+theme(plot.margin = unit(c(0,0,0,0), "cm"))
+
+py4<-p2$`z:Gli3_155`+theme(axis.title=element_blank(), plot.title=
+element_blank()) +geom_label(aes(x=Inf,y=-Inf,hjust=1,vjust=0,label="-1.5 to 0.9"))+theme(legend.text=element_blank(), legend.title=element_text(size=14),plot.margin = unit(c(0,0,0,0), "cm"))+ guides(fill = guide_colourbar(title= "Deviation Scores\nlow                high",  title.position = "top",title.hjust =0.5, barwidth=8))
+
+
+
+pdf(file ='SFig5C_TF_to_GENE.pdf', width =5, height =10.5)
+cowplot::plot_grid(px1,py1,px2,py2, px3, py3,px4,py4, ncol = 2,rel_widths=c(1,1,1,1),rel_heights=c(1.15,1,1,1.54), align=c("v","h"))
+dev.off()
+
+
+
+######################
+
+######
+S2Figure
+
+s2a <- plotFragmentSizes(ArchRProj = proj)+scale_color_manual(labels=c("PBS", "LPS"),values=c("#0077b6", "#F8766D"))+theme(axis.text=element_text(size=18),  axis.title=element_text(size=20), legend.position=c(0.85,0.9), legend.title=element_blank(), legend.text=element_text(size=16))
+
+dev.new()
+ggsave(filename="S2FigA.tiff",s2a, width =15, height =15, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+s2b <- plotTSSEnrichment(ArchRProj  = proj)+scale_color_manual(labels=c("PBS", "LPS"),values=c("#0077b6", "#F8766D"))+theme(axis.text=element_text(size=18),  axis.title=element_text(size=20), legend.position=c(0.85,0.9), legend.title=element_blank(), legend.text=element_text(size=16))
+
+dev.new()
+ggsave(filename="S2FigB.tiff",s2b, width =15, height =15, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+s2c <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Sample", 
+    colorBy = "cellColData", 
+    name = "log10(nFrags)",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )+scale_x_discrete(breaks=c("Control","LPS"), labels=c("PBS","LPS"))+theme(axis.text.x=element_text(size=18, angle=0 ,hjust=0.5), axis.text.y=element_text(size=18), axis.title.x=element_blank(), axis.title.y=element_text(size=20), legend.position="none")+scale_fill_manual(values=c("#0077b6", "#F8766D"))+scale_color_manual(values=c("#0077b6", "#F8766D"))
+
+dev.new()
+ggsave(filename="S2FigC.tiff",s2c, width =10, height =10, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+
+s2d <- plotGroups(
+    ArchRProj = proj, 
+    groupBy = "Sample", 
+    colorBy = "cellColData", 
+    name = "TSSEnrichment",
+    plotAs = "violin",
+    alpha = 0.4,
+    addBoxPlot = TRUE
+   )+scale_x_discrete(breaks=c("Control","LPS"), labels=c("PBS","LPS"))+theme(axis.text.x=element_text(size=18, angle=0 ,hjust=0.5), axis.text.y=element_text(size=18), axis.title.x=element_blank(), axis.title.y=element_text(size=20), legend.position="none")+scale_fill_manual(values=c("#0077b6", "#F8766D"))+scale_color_manual(values=c("#0077b6", "#F8766D"))
+
+dev.new()
+ggsave(filename="S2FigD.tiff",s2d, width =10, height =10, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+
+
+#s2f
+simpson<-function(data,type="complement"){
+simpson.diversity<-numeric(ncol(data))
+for(j in 1:ncol(data)){
+soma<-sum(data[,j])
+prop<-data[,j]/soma
+prop2<-prop^2
+D<-sum(prop2)
+if(type=="inverse") (simp<-1/D)
+if(type=="complement") (simp<-1-D)
+simpson.diversity[j]<-simp
+}
+plot.number<-1:ncol(data)
+return(rbind(plot.number,simpson.diversity))
+}
+plots<-table(proj2$Clusters2, proj2$Sample2)
+d<-simpson(plots)
+d2<-data.frame(key=c("LPS", "PBS"), index=c(d[2,1], d[2,2]))
+
+d2$key<-factor(d2$key, level=c("PBS", "LPS"))
+
+p<-ggplot(d2,aes(key, index))+geom_bar(stat="identity", fill=c("#F8766D","#0077b6"), alpha=0.6, width=0.5) + theme_classic2()+ylab("Simpson index")+
+theme(axis.text=element_text(size=18), axis.title.x=element_blank(), axis.title.y=element_text(size=20))+ylim(0,1)
+
+dev.new()
+ggsave(filename="S2FigF.CellDivIndex.tiff",p, width =10, height =10, units ="cm", dpi=600, device="tiff", limitsize=TRUE, compression = "lzw")
+dev.off()
+
+
+#####2022-03-21
+##GenesMki67, Pcna, Mcm2, Shh, Ptch1, lgr5, k5, and k14
+##FeaturePlots
+markerGenes  <- c( "Mki67", "Pcna",  "Mcm2","Shh", "Ptch1", "lgr5", "Krt5", "Krt14")
+    
+p <- plotEmbedding(
+    ArchRProj = PBSproj, 
+    colorBy = "GeneScoreMatrix", 
+    name = markerGenes, 
+    embedding = "UMAP",
+    imputeWeights = getImputeWeights(PBSproj)
+)
+
+
+pz<-p[[1]]+
+    theme(legend.title=element_text(size=18),legend.text=element_text(size=14),
+        legend.position="bottom", legend.key.width = unit(1.8, "cm")) +scale_fill_gradientn(colours = 
+        colorspace::diverge_hcl(7),breaks=c(0, 1.2), labels=c("Minimum", "Maximum"), limits=c(0,1.2))+ guides(fill = guide_colourbar(title="Normalized score",title.position="top", title.hjust = .5,label.position = "bottom"))
+ 
+legend <- get_legend(pz)
+ 
+        
+for (i in 1:8){
+ p[[i]]<-p[[i]]+ theme(plot.margin = unit(c(0.1, 0.15, 0.1, 0.15), "cm"))+
+    theme(
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(),
+        plot.title=element_text(hjust=0.5,size=24, face='bold'), 
+        axis.title=element_blank(),
+        legend.position="none"
+    )+ggtitle(paste0(markerGenes[i],"_PBS"))+scale_fill_gradientn(colours = 
+        colorspace::diverge_hcl(7))
+}
+
+px<-cowplot::plot_grid(p[[1]],p[[2]],p[[3]],p[[4]],p[[5]],p[[6]],p[[7]],p[[8]],scale = 1, ncol=1)
+
+##
+p2 <- plotEmbedding(
+    ArchRProj = proj, 
+    colorBy = "GeneScoreMatrix", 
+    name = markerGenes, 
+    embedding = "UMAP",
+    imputeWeights = getImputeWeights(proj)
+)
+       
+for (i in 1:8){
+ p2[[i]]<-p2[[i]]+ theme(plot.margin = unit(c(0.1, 0.15, 0.1, 0.15), "cm"))+
+    theme(
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(),
+        plot.title=element_text(hjust=0.5,size=24, face='bold'), 
+        axis.title=element_blank(),
+        legend.position="none"
+    )+ggtitle(paste0(markerGenes[i],"_ALL"))+scale_fill_gradientn(colours = 
+        colorspace::diverge_hcl(7))
+}
+
+px2<-cowplot::plot_grid(p2[[1]],p2[[2]],p2[[3]],p2[[4]],p2[[5]],p2[[6]],p2[[7]],p2[[8]],scale = 1, ncol=1)
+
+##
+p1 <- plotEmbedding(
+    ArchRProj = LPSproj, 
+    colorBy = "GeneScoreMatrix", 
+    name = markerGenes, 
+    embedding = "UMAP",
+    imputeWeights = getImputeWeights(LPSproj)
+)
+       
+for (i in 1:8){
+ p1[[i]]<-p1[[i]]+ theme(plot.margin = unit(c(0.1, 0.15, 0.1, 0.15), "cm"))+
+    theme(
+        axis.text.x=element_blank(), 
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(), 
+        axis.ticks.y=element_blank(),
+        plot.title=element_text(hjust=0.5,size=24, face='bold'), 
+        axis.title=element_blank(),
+        legend.position="none"
+    )+ggtitle(paste0(markerGenes[i],"_LPS"))+scale_fill_gradientn(colours = 
+        colorspace::diverge_hcl(7))
+}
+
+
+px1<-cowplot::plot_grid(p1[[1]],p1[[2]],p1[[3]],p1[[4]],p1[[5]],p1[[6]],p1[[7]],p1[[8]], scale = 1, ncol=1)
+###################
+
+
+
+
+
+py<-cowplot::plot_grid(px, px1, px2,rel_heights = c(1,1,1),ncol=3, align="v",scale = 1)
+py1<-cowplot::plot_grid(py, legend,rel_heights = c(1,0.05),ncol=1, align="c",scale = 1)
+
+dev.new()
+pdf(file ='/home/cailu/UMAP_20220321_v2.pdf',width =6.5, height =26)
+py1
+dev.off()
+
+
+
+
+
+####GenomeBrowser#Mki67, Pcna, Mcm2, Shh, and Ptch1
+markerGenes<- c( "Mki67", "Pcna",  "Mcm2","Shh", "Ptch1", "lgr5", "Krt5", "Krt14")
+    
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = LPSproj3, 
+    groupBy = "Clusters2", 
+    geneSymbol = markerGenes,
+    upstream = 50000,
+    downstream = 50000,
+    loops = getCoAccessibility(LPSproj3))
+
+
+grid::grid.newpage()
+grid::grid.draw(p$Mki67)
+plotPDF(plotList = p, 
+    name = "LPS-Tracks-Marker-Genes-with-CoAccessibility0321.pdf", 
+    ArchRProj = proj, 
+    addDOC = FALSE, width = 15, height = 8)
+
+
+
+################################################S3 Figure
+#####################################################################
+g<-c("Entpd2", "Kcnj1", "Tas2r138", "Tas2r134","Tas2r119", "Tas2r107","Pou2f3", "Gnat3","Plcb2","Calhm1",
+"Gad1","Car4","PKD2l1","Otop1")
+
+p <- plotBrowserTrack(
+    baseSize=12,
+    facetbaseSize = 14,
+    ArchRProj = PBSproj3, 
+    groupBy = "Clusters2", 
+    geneSymbol = "Pou2f3",
+    tileSize = 125,
+    upstream = 90000,
+    downstream = 10000,
+    plotSummary = c("bulkTrack",  "geneTrack"),
+    sizes = c(12, 3)
+    )
+
+grid::grid.newpage()
+grid::grid.draw(p$Pou2f3)
+
+plotPDF(plotList = p, 
+    name = "S3_Fig_Tracks-Marker-Pou2f3.pdf", 
+    ArchRProj = PBSproj, 
+    addDOC = FALSE, width = 11, height = 6)
+
+
+
+
+
+##################################################not work
+MotifPlot <- function(
+  object,
+  motifs,
+  assay = NULL,
+  use.names = TRUE,
+  ...
+) {
+  assay <- SetIfNull(x = assay, y = DefaultAssay(object = object))
+  if (!inherits(x = object[[assay]], what = "ChromatinAssay")) {
+    stop("The requested assay is not a ChromatinAssay.")
+  }
+  data.use <- GetMotifData(object = object, assay = assay, slot = "pwm")
+  if (length(x = data.use) == 0) {
+    stop("Position weight matrix list for the requested assay is empty")
+  }
+  data.use <- data.use[motifs]
+  if (use.names) {
+    names(x = data.use) <- GetMotifData(
+      object = object, assay = assay, slot = "motif.names"
+    )[motifs]
+  }
+  p <- ggseqlogo(data = data.use, ...)
+  return(p)
+}
+############################################
