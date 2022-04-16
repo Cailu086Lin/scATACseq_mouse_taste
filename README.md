@@ -15,6 +15,8 @@ many previously characterized taste-cell-selective genes and revealed potential 
 broad changes in chromatin accessibility of immune response genes in progenitor/stem cells and taste bud cells. Together, our results reveal
 an epigenetic mechanism connecting inflammation and altered bitter taste.
 
+
+####
 sessionInfo()
 R version 4.1.3 (2022-03-10)
 Platform: x86_64-pc-linux-gnu (64-bit)
