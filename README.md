@@ -1,4 +1,4 @@
-Analysis provided in the "Inflammation-induced bitter taste responses and epigenetic changes in progenitors and taste bud cells" manuscript
+Analysis provided in the manuscript titled "Inflammation-induced bitter taste responses and epigenetic changes in progenitors and taste bud cells" 
 
 This repository is meant to provide the source code for the analysis provided in the above manuscript by C Lin, M Jotaki, J Quinlan, S Feng, 
 M Zhou, P Feng, M Tordoff, A Bachmanov, P Jiang, L Huang, I Matsumoto, Y Ninomiya, RF Margolskee, D Reed, H Wang
