@@ -3184,29 +3184,3 @@ plotPDF(plotList = p,
 
 
 
-##################################################not work
-MotifPlot <- function(
-  object,
-  motifs,
-  assay = NULL,
-  use.names = TRUE,
-  ...
-) {
-  assay <- SetIfNull(x = assay, y = DefaultAssay(object = object))
-  if (!inherits(x = object[[assay]], what = "ChromatinAssay")) {
-    stop("The requested assay is not a ChromatinAssay.")
-  }
-  data.use <- GetMotifData(object = object, assay = assay, slot = "pwm")
-  if (length(x = data.use) == 0) {
-    stop("Position weight matrix list for the requested assay is empty")
-  }
-  data.use <- data.use[motifs]
-  if (use.names) {
-    names(x = data.use) <- GetMotifData(
-      object = object, assay = assay, slot = "motif.names"
-    )[motifs]
-  }
-  p <- ggseqlogo(data = data.use, ...)
-  return(p)
-}
-############################################
