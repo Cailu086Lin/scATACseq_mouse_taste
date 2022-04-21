@@ -24,17 +24,6 @@ ArrowFiles <- createArrowFiles(inputFiles=inputFiles,
   addGeneScoreMat = TRUE)
 
 
-### Inferring Doublets
-doubScores <- addDoubletScores(
-  input = ArrowFiles,
-  k = 10, #Refers to how many cells near a "pseudo-doublet" to count.
-  knnMethod = "UMAP", #Refers to the embedding to use for nearest neighbor search.
-  LSIMethod = 1
-)
-
-
-
-
 #### create ArchRProject}
 proj <- ArchRProject(
   ArrowFiles = ArrowFiles, 
