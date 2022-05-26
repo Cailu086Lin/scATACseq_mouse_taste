@@ -1,19 +1,11 @@
-Analysis provided in the manuscript titled "Inflammation-induced bitter taste responses and epigenetic changes in progenitors and taste bud cells" 
+Analysis provided in the manuscript titled "Inflammation causes bitter taste oversensitization via epigenetic changes in taste buds" 
 
 This repository is meant to provide the source code for the analysis provided in the above manuscript by C Lin, M Jotaki, J Quinlan, S Feng, 
-M Zhou, P Feng, M Tordoff, A Bachmanov, P Jiang, L Huang, I Matsumoto, Y Ninomiya, RF Margolskee, D Reed, H Wang
+M Zhou, P Jiang, I Matsumoto, L Huang, Y Ninomiya, RF Margolskee, D Reed, H Wang
 
 Abstract
 
-Chemosensory dysfunction often occurs with infection and cancer and contributes to food aversion and poor quality of life. The underlying 
-mechanisms of taste dysfunction, especially of taste distortion, such as elevated and lingering bitter taste, are poorly understood. Here 
-we report that, in an inflammation model mimicking bacterial infection, mice showed markedly heightened neural and behavioral responses to 
-bitter taste compounds. Consistently, the expression of many Tas2rs, the bitter receptor genes, was significantly up-regulated in the taste
-tissues. Using single-cell assays for transposase-accessible chromatin with sequencing (scATAC-seq) we discovered that multiple Tas2r gene 
-loci became more accessible during inflammation. Additionally, scATAC-seq analyses confirmed cell-type-specific chromatin accessibility of 
-many previously characterized taste-cell-selective genes and revealed potential regulatory mechanisms. Furthermore, our results revealed 
-broad changes in chromatin accessibility of immune response genes in progenitor/stem cells and taste bud cells. Together, our results reveal
-an epigenetic mechanism connecting inflammation and altered bitter taste.
+Chemosensory dysfunction often occurs with infection and cancer and contributes to food aversion and low quality of life. The underlying mechanisms of taste dysfunction, especially taste distortion, such as elevated and lingering bitter taste, are poorly understood. Here we report that, in an inflammation model mimicking bacterial infection, mice showed markedly heightened neural and behavioral responses to bitter compounds. Consistently, inflammation significantly up-regulated the expression of many Tas2r bitter receptor genes in taste tissues. Using single-cell assays for transposase-accessible chromatin with sequencing (scATAC-seq), we discovered that multiple Tas2r loci became more accessible during inflammation. Further scATAC-seq analyses revealed cell-type-specific chromatin accessibility of many taste-cell-selective genes and identified potential transcriptional regulators. Inflammation also induced substantial chromatin remodeling in immune response genes in taste tissue stem cells. Together, our results reveal an epigenetic mechanism connecting inflammation and altered bitter taste.
 
 
 ####
