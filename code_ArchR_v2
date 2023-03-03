@@ -158,7 +158,7 @@ proj<- addHarmony(
 )
 
 ########
-proj <- addClusters(input = proj, reducedDims = "IterativeLSI", force = TRUE)
+proj <- addClusters(input = proj, reducedDims = "Harmony", force = TRUE)
 
 
 
@@ -167,7 +167,7 @@ proj <- addClusters(input = proj, reducedDims = "IterativeLSI", force = TRUE)
 
 
 
-proj <- addUMAP(ArchRProj = proj, reducedDims = "IterativeLSI")
+proj <- addUMAP(ArchRProj = proj, reducedDims = "Harmony")
 
 
 #########
