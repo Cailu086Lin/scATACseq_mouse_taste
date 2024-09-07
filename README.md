@@ -1,3 +1,4 @@
+#  scATACseq_mouse_taste
 Analysis provided in the manuscript titled "Inflammation causes bitter taste oversensitization via epigenetic changes in taste buds" 
 
 This repository is meant to provide the source code for the analysis provided in the above manuscript by C Lin, M Jotaki, J Quinlan, S Feng, 
